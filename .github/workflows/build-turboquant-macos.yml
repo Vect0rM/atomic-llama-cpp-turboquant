@@ -47,11 +47,14 @@ jobs:
           sysctl -a
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_BUILD_RPATH="@loader_path" \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
             -DGGML_METAL=ON \
             -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
@@ -62,6 +65,18 @@ jobs:
           echo "---"
           file ./build/bin/llama-server
           ./build/bin/llama-server --version 2>&1 || true
+
+      - name: Verify BoringSSL static linkage
+        run: |
+          echo "=== Checking for dynamic SSL/crypto (should be empty) ==="
+          if otool -L build/bin/llama-server | grep -iE 'ssl|crypto|homebrew'; then
+            echo "ERROR: Found dynamic SSL/crypto linkage — BoringSSL not static!"
+            exit 1
+          fi
+          echo "OK: No dynamic SSL/crypto — BoringSSL is statically linked"
+          echo "---"
+          echo "=== Binary size ==="
+          ls -lh build/bin/llama-server
 
       - name: Prepare release archive
         run: |
