@@ -47,9 +47,9 @@ jobs:
           sysctl -a
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_RPATH='@loader_path' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
             -DGGML_METAL=ON \
             -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
@@ -57,7 +57,7 @@ jobs:
             -DLLAMA_BUILD_TOOLS=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release -j $(sysctl -n hw.ncpu)
 
       - name: Verify turbo3 support
         run: |
@@ -66,14 +66,17 @@ jobs:
           file ./build/bin/llama-server
           ./build/bin/llama-server --version 2>&1 || true
 
-      - name: Verify BoringSSL static linkage
+      - name: Verify static binary
         run: |
-          echo "=== Checking for dynamic SSL/crypto (should be empty) ==="
-          if otool -L build/bin/llama-server | grep -iE 'ssl|crypto|homebrew'; then
-            echo "ERROR: Found dynamic SSL/crypto linkage — BoringSSL not static!"
+          echo "=== All dynamic dependencies (should be system-only) ==="
+          otool -L build/bin/llama-server
+          echo "---"
+          echo "=== Checking for non-system dylibs (should be empty) ==="
+          if otool -L build/bin/llama-server | grep -vE '/usr/lib|/System|llama-server' | grep '\.dylib'; then
+            echo "ERROR: Found non-system dynamic dependency!"
             exit 1
           fi
-          echo "OK: No dynamic SSL/crypto — BoringSSL is statically linked"
+          echo "OK: Only system dylibs — fully self-contained binary"
           echo "---"
           echo "=== Binary size ==="
           ls -lh build/bin/llama-server
