@@ -57,6 +57,7 @@
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -2437,6 +2438,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+    } else if (!split && is_tq_weight && src1->ne[1] == 1) {
+        // Fused TQ weight mul_mat_vec with pre-rotated activations via warp shuffle WHT
+        ggml_cuda_mul_mat_vec_tq(ctx, src0, src1, dst);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
