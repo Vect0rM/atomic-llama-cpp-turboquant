@@ -333,6 +333,11 @@ struct mtmd_context {
             // <|IMAGE_START|> ... (image embeddings) ... <|IMAGE_END|>
             img_beg = "<|IMAGE_START|>";
             img_end = "<|IMAGE_END|>";
+
+        } else if (proj == PROJECTOR_TYPE_GEMMA4V) {
+            // <|image> ... (image embeddings) ... <image|>
+            img_beg = "<|image>";
+            img_end = "<image|>";
         }
     }
 
@@ -888,6 +893,7 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
     switch (ctx->proj_type_v()) {
         case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_GEMMA4V:
             return true;
         default:
             return false;
