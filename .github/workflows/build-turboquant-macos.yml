@@ -129,9 +129,10 @@ jobs:
           find build -name "*.dylib" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           find build -name "*.metal" -path "*/bin/*" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           cd release
+          zip -r ../llama-turboquant-macos-arm64.zip .
           tar -czf ../llama-turboquant-macos-arm64.tar.gz .
           cd ..
-          ls -lh llama-turboquant-macos-arm64.tar.gz
+          ls -lh llama-turboquant-macos-arm64.zip llama-turboquant-macos-arm64.tar.gz
 
       - name: Notarize release archive
         env:
@@ -140,7 +141,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           echo "Submitting for notarization..."
-          xcrun notarytool submit llama-turboquant-macos-arm64.tar.gz \
+          xcrun notarytool submit llama-turboquant-macos-arm64.zip \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
