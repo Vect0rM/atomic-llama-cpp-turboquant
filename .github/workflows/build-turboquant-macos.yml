@@ -125,7 +125,7 @@ jobs:
               --sign "$CODESIGN_IDENTITY" "$lib"
           done
 
-      - name: Prepare release contents
+      - name: Prepare release archive
         run: |
           mkdir -p release/build/bin
           cp build/bin/llama-server release/build/bin/
@@ -134,31 +134,25 @@ jobs:
           cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
           find build -name "*.dylib" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           find build -name "*.metal" -path "*/bin/*" -exec cp {} release/build/bin/ \; 2>/dev/null || true
+          cd release
+          zip -r ../llama-turboquant-macos-arm64.zip .
+          tar -czf ../llama-turboquant-macos-arm64.tar.gz .
+          cd ..
+          ls -lh llama-turboquant-macos-arm64.zip llama-turboquant-macos-arm64.tar.gz
 
-      - name: Create DMG
-        run: |
-          hdiutil create -volname "LlamaTurboQuant" \
-            -srcfolder release \
-            -ov -format UDZO \
-            llama-turboquant-macos-arm64.dmg
-          ls -lh llama-turboquant-macos-arm64.dmg
-
-      - name: Notarize DMG
+      - name: Notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          echo "Submitting DMG for notarization..."
-          xcrun notarytool submit llama-turboquant-macos-arm64.dmg \
+          echo "Submitting zip for notarization..."
+          xcrun notarytool submit llama-turboquant-macos-arm64.zip \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait --timeout 10m
-          echo "Stapling notarization ticket to DMG..."
-          xcrun stapler staple llama-turboquant-macos-arm64.dmg
-          echo "Verifying staple..."
-          xcrun stapler validate llama-turboquant-macos-arm64.dmg
+          echo "Notarization complete — CDHash registered with Apple"
 
       - name: Clean up keychain
         if: always()
@@ -190,11 +184,8 @@ jobs:
 
             ### Usage
             ```bash
-            # Mount the DMG, then copy binaries:
-            hdiutil attach llama-turboquant-macos-arm64.dmg
-            cp -R /Volumes/LlamaTurboQuant/build/bin/ ./llama-bin/
-            hdiutil detach /Volumes/LlamaTurboQuant
-            ./llama-bin/llama-server -m model.gguf --cache-type-k turbo3 --cache-type-v turbo3
+            tar -xzf llama-turboquant-macos-arm64.tar.gz
+            ./build/bin/llama-server -m model.gguf --cache-type-k turbo3 --cache-type-v turbo3
             ```
 
             ### For Atomic Chat integration
@@ -202,6 +193,6 @@ jobs:
             ```
             ~/Library/Application Support/Atomic Chat/data/llamacpp/backends/<version>/macos-arm64/build/bin/llama-server
             ```
-          files: llama-turboquant-macos-arm64.dmg
+          files: llama-turboquant-macos-arm64.tar.gz
           draft: false
           prerelease: true
