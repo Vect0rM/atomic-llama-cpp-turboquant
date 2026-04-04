@@ -152,9 +152,6 @@ jobs:
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait --timeout 10m
-          echo "Stapling notarization ticket to zip..."
-          xcrun stapler staple llama-turboquant-macos-arm64.zip
-
           echo "=== Notarizing individual binaries (for tar.gz users) ==="
           for bin in build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-perplexity; do
             if [ -f "$bin" ]; then
