@@ -114,6 +114,7 @@ jobs:
             if [ -f "$bin" ]; then
               echo "Signing $bin ..."
               codesign --force --options runtime --timestamp \
+                --entitlements .github/entitlements.plist \
                 --sign "$CODESIGN_IDENTITY" "$bin"
               codesign --verify --verbose "$bin"
             fi
