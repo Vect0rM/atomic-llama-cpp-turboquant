@@ -135,20 +135,31 @@ jobs:
           find build -name "*.dylib" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           find build -name "*.metal" -path "*/bin/*" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           cd release
+          zip -r ../llama-turboquant-macos-arm64.zip .
           tar -czf ../llama-turboquant-macos-arm64.tar.gz .
           cd ..
-          ls -lh llama-turboquant-macos-arm64.tar.gz
+          ls -lh llama-turboquant-macos-arm64.zip llama-turboquant-macos-arm64.tar.gz
 
-      - name: Notarize binaries
+      - name: Notarize release archive
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          echo "=== Notarizing zip archive ==="
+          xcrun notarytool submit llama-turboquant-macos-arm64.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 10m
+          echo "Stapling notarization ticket to zip..."
+          xcrun stapler staple llama-turboquant-macos-arm64.zip
+
+          echo "=== Notarizing individual binaries (for tar.gz users) ==="
           for bin in build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-perplexity; do
             if [ -f "$bin" ]; then
               name=$(basename "$bin")
-              echo "=== Notarizing $name ==="
+              echo "--- Notarizing $name ---"
               zip -j "${name}.zip" "$bin"
               xcrun notarytool submit "${name}.zip" \
                 --apple-id "$APPLE_ID" \
@@ -156,9 +167,9 @@ jobs:
                 --team-id "$APPLE_TEAM_ID" \
                 --wait --timeout 10m
               rm "${name}.zip"
-              echo "=== $name notarized ==="
             fi
           done
+          echo "=== All notarization complete ==="
 
       - name: Clean up keychain
         if: always()
@@ -190,7 +201,11 @@ jobs:
 
             ### Usage
             ```bash
+            # Option 1: zip (notarized + stapled)
+            unzip llama-turboquant-macos-arm64.zip
+            # Option 2: tar.gz
             tar -xzf llama-turboquant-macos-arm64.tar.gz
+
             ./build/bin/llama-server -m model.gguf --cache-type-k turbo3 --cache-type-v turbo3
             ```
 
@@ -199,6 +214,8 @@ jobs:
             ```
             ~/Library/Application Support/Atomic Chat/data/llamacpp/backends/<version>/macos-arm64/build/bin/llama-server
             ```
-          files: llama-turboquant-macos-arm64.tar.gz
+          files: |
+            llama-turboquant-macos-arm64.zip
+            llama-turboquant-macos-arm64.tar.gz
           draft: false
           prerelease: true
