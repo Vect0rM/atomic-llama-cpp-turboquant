@@ -135,24 +135,30 @@ jobs:
           find build -name "*.dylib" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           find build -name "*.metal" -path "*/bin/*" -exec cp {} release/build/bin/ \; 2>/dev/null || true
           cd release
-          zip -r ../llama-turboquant-macos-arm64.zip .
           tar -czf ../llama-turboquant-macos-arm64.tar.gz .
           cd ..
-          ls -lh llama-turboquant-macos-arm64.zip llama-turboquant-macos-arm64.tar.gz
+          ls -lh llama-turboquant-macos-arm64.tar.gz
 
-      - name: Notarize
+      - name: Notarize binaries
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          echo "Submitting zip for notarization..."
-          xcrun notarytool submit llama-turboquant-macos-arm64.zip \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_ID_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 10m
-          echo "Notarization complete — CDHash registered with Apple"
+          for bin in build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-perplexity; do
+            if [ -f "$bin" ]; then
+              name=$(basename "$bin")
+              echo "=== Notarizing $name ==="
+              zip -j "${name}.zip" "$bin"
+              xcrun notarytool submit "${name}.zip" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_ID_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait --timeout 10m
+              rm "${name}.zip"
+              echo "=== $name notarized ==="
+            fi
+          done
 
       - name: Clean up keychain
         if: always()
