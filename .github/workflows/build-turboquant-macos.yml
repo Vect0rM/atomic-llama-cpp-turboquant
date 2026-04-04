@@ -119,6 +119,11 @@ jobs:
               codesign --verify --verbose "$bin"
             fi
           done
+          for lib in $(find build -name "*.dylib" 2>/dev/null); do
+            echo "Signing dylib $lib ..."
+            codesign --force --options runtime --timestamp \
+              --sign "$CODESIGN_IDENTITY" "$lib"
+          done
 
       - name: Prepare release archive
         run: |
