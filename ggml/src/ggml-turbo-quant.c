@@ -236,6 +236,37 @@ static void turbo_cpu_fwht(float * x, int group_size) {
     for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s2[i];
 }
 
+/* ---------- CPU inverse WHT (in-place, group_size elements) ----------
+ *
+ * Forward is  y = D(s2) * N * H * D(s1) * x   (N = 1/sqrt(group_size))
+ * H is the unnormalized Hadamard butterfly with H*H = group_size * I, so
+ * (N*H) is self-inverse.  s1 and s2 are ±1 diagonals, also self-inverse.
+ * The inverse therefore has the same structure with s1 and s2 swapped:
+ *     x = D(s1) * N * H * D(s2) * y
+ */
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
+    const float * s1 = turbo_cpu_s1;
+    const float * s2 = turbo_cpu_s2;
+    const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
+
+    // signs2 (undoes the s2 that was applied last in the forward pass)
+    for (int i = 0; i < group_size; i++) x[i] *= s2[i];
+
+    // butterfly stages (same as forward — self-inverse up to the inv_sqrt scaling below)
+    for (int h = 1; h < group_size; h *= 2) {
+        for (int i = 0; i < group_size; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+
+    // normalize + signs1
+    for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s1[i];
+}
+
 /* ---------- TURBO3_0: 3-bit PolarQuant with WHT rotation ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
