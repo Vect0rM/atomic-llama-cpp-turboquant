@@ -8741,6 +8741,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.offload_kqv,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
+                            cparams.n_rollback_max,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch)) {
                     // The main difference between hybrid architectures is the
@@ -8774,6 +8775,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rollback_max    */ cparams.n_rollback_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -8792,6 +8794,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rollback_max    */ cparams.n_rollback_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -9817,6 +9820,10 @@ bool llama_model_is_hybrid(const llama_model * model) {
 
 bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
+}
+
+bool llama_model_supports_recurrent_partial_rollback(const llama_model * model) {
+    return llm_arch_supports_recurrent_partial_rollback(model->arch);
 }
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {

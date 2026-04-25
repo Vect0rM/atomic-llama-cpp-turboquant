@@ -868,6 +868,16 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 
 std::string                   get_model_endpoint();
 
+// Whether the context can partially remove sequence cells (affects speculative rollback).
+enum common_context_seq_rm_type {
+    COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
+    COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED = 3, // can seq_rm partial sequences, bounded by n_rollback_max
+};
+
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+
 //
 // Batch utils
 //

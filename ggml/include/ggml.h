@@ -2543,7 +2543,8 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * state,
+            bool                  keep_intermediates);
 
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
