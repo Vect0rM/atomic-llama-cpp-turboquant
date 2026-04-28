@@ -57,6 +57,9 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
 
+    // seq_rm capability for speculative checkpoints / GDN rollback (see common_context_can_seq_rm)
+    common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
     common_speculative * spec = nullptr;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -781,6 +784,11 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
+        const common_context_seq_rm_type ctx_seq_rm_global = common_context_can_seq_rm(ctx);
+        if (ctx_seq_rm_global == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            SRV_WRN("%s", "speculative decoding may use checkpoints (full sequence removal only)\n");
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot slot;
@@ -788,6 +796,8 @@ private:
             slot.id    = i;
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
+
+            slot.ctx_seq_rm_type = ctx_seq_rm_global;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2532,13 +2542,18 @@ private:
                     // checkpoints are created only if:
                     // - the model uses SWA and we are not using `swa_full`
                     // - the model architecture is marked as recurrent or hybrid
+                    // - sequence removal is full-only or bounded partial (GDN / speculative rollback)
                     //
                     // TODO: try to make this conditional on the context or the memory module, instead of the model type
-                    do_checkpoint = do_checkpoint && (
-                            llama_model_is_recurrent(model) ||
-                            llama_model_is_hybrid(model) ||
-                            (llama_model_n_swa(model) > 0 && !params_base.swa_full)
-                            );
+                    {
+                        const bool n_swa_active = llama_model_n_swa(model) > 0 && !params_base.swa_full;
+                        do_checkpoint = do_checkpoint && (
+                                slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL
+                                || slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED
+                                || n_swa_active
+                                || llama_model_is_recurrent(model)
+                                || llama_model_is_hybrid(model));
+                    }
 
                     bool has_mtmd = false;
 
