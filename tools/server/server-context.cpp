@@ -700,8 +700,8 @@ private:
 
                 params_base.speculative.model_dft = model_dft.get();
                 params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
-                // draft context does not need recurrent rollback snapshots (target owns n_rollback_max)
-                params_base.speculative.cparams_dft.n_rollback_max = 0;
+                // draft context does not need recurrent rollback snapshots (target owns n_rs_seq)
+                params_base.speculative.cparams_dft.n_rs_seq = 0;
             }
         }
 
