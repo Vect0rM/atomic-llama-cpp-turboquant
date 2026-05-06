@@ -120,7 +120,7 @@ public:
     const int64_t n_embd = 0;
 };
 
-// Gemma 4 MTP: last target token id + backbone hidden (n_bb floats) for a single step
+// Gemma 4 MTP: last target token id + backbone hidden (n_bb floats) for a single step.
 class llm_graph_input_mtp : public llm_graph_input_i {
 public:
     llm_graph_input_mtp() = default;
