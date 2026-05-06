@@ -2153,7 +2153,12 @@ private:
                     slot.drafted = std::move(draft);
                 }
             } else {
-                // no speculative decoding
+                // no speculative decoding for this iteration (e.g. n_remaining == 1 or n_min not satisfied)
+                // drain any in-flight async MTP submitted by the previous iteration's prepare_next,
+                // otherwise the MTP worker would compute concurrently with the upcoming target_decode
+                // on the same backend (race -> Metal command buffer status 3 on turbo3 KV)
+                common_speculative_cancel(slot.spec);
+
                 slot.i_batch = batch.n_tokens;
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2969,6 +2974,8 @@ private:
 
                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
+                common_speculative_prepare_next(slot.spec, slot.sampled);
+
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
 
@@ -2982,6 +2989,9 @@ private:
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);
+                        // Drain any pending depth-2 MTP submit before slot.release: the next
+                        // request will seq_rm and overwrite KV cells the worker is still reading.
+                        common_speculative_cancel(slot.spec);
                         slot.release();
 
                         break;
