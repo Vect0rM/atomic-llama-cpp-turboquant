@@ -280,6 +280,14 @@ struct llm_build_gemma4_iswa : public llm_graph_context {
     ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
 };
 
+// Gemma 4 MTP: target model supplies tok_embd rows + KV; mtp_model supplies assistant weights.
+struct llm_build_gemma4_mtp : public llm_graph_context {
+    const llama_model & target;
+    const llama_model & mtp;
+
+    llm_build_gemma4_mtp(const llama_model & target, const llama_model & mtp_model, const llm_graph_params & params);
+};
+
 struct llm_build_gemma_embedding : public llm_graph_context {
     llm_build_gemma_embedding(const llama_model & model, const llm_graph_params & params);
 };

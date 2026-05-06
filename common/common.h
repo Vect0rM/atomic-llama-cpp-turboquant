@@ -177,6 +177,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_MTP,           // Gemma 4 MTP assistant drafter
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -316,6 +317,9 @@ struct common_params_speculative {
 
     int32_t n_max   = 16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
+
+    // MTP (Gemma 4 assistant): draft block size B produces B-1 draft tokens per round (default 4)
+    int32_t draft_block_size = 4;
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
 
