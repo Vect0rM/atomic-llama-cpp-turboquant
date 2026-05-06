@@ -662,6 +662,10 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    // Optional in-graph argmax tensor (I32 [n_outputs]). Currently set only by the
+    // Gemma4 MTP graph so the host can read a 4-byte argmax instead of an
+    // n_vocab-float logits row + CPU argmax loop.
+    ggml_tensor * get_argmax()      const { return t_argmax; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -690,6 +694,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_argmax      = nullptr; // optional, currently MTP-only (see get_argmax)
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
