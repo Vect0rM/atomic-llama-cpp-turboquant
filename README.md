@@ -72,6 +72,99 @@ range of hardware - locally and in the cloud.
 
 The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
 
+## Gemma 4 MTP — speculative decoding
+
+This fork ships a first-class implementation of **Multi-Token Prediction (MTP)**
+speculative decoding for **Gemma 4** targets paired with the official
+**`gemma4_assistant`** drafter head. Unlike a classical draft-model setup, the
+assistant is loaded **into the target context** (no second `llama_context`,
+no second tokenizer, no separate KV cache) and runs on a dedicated scheduler
+so MTP draft compute overlaps target verification.
+
+Highlights:
+
+- **+30-50 % short-prompt throughput** on Gemma 4 26B-A4B / 31B in the
+  matrix bench (`f16` KV); accept rate ~85-88 % on dense targets.
+- **Async pipeline (depth-2)** with `llama_decode_mtp_async` /
+  `llama_decode_mtp_wait` so MTP work overlaps server post-accept bookkeeping.
+- **In-graph argmax** — host transfers 4 bytes per draft step instead of the
+  full F32 `[n_vocab]` row.
+- **Centroid LM head** for Edge variants (E2B / E4B); dense tied head for
+  26B-A4B / 31B.
+
+### Pre-built assistant GGUFs
+
+Recommended quantization is **`Q4_K_M`** (throughput is identical to F16 on
+this assistant size — bandwidth, not weight precision, dominates — while
+footprint is ~4× lower). Also published: `Q4_K_S`, `Q5_K_M`, `Q8_0`, `F16`.
+
+> [AtomicChat / Gemma 4 Assistant GGUF collection](https://huggingface.co/collections/AtomicChat/gemma-4-assistant-gguf)
+
+| Target model | Assistant (MTP head) GGUF |
+|---|---|
+| Gemma 4 E2B | [`AtomicChat/gemma-4-E2B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-E2B-it-assistant-GGUF) |
+| Gemma 4 E4B | [`AtomicChat/gemma-4-E4B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF) |
+| Gemma 4 26B-A4B | [`AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF) |
+| Gemma 4 31B | [`AtomicChat/gemma-4-31B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-31B-it-assistant-GGUF) |
+
+### Quick start
+
+```bash
+# Manual invocation — works for any of the four targets above.
+llama-server \
+  -m /path/to/gemma-4-target.gguf \
+  --mtp-head /path/to/gemma-4-assistant-Q4_K_M.gguf \
+  --spec-type mtp \
+  --draft-block-size 3 \
+  -c 16384 \
+  -ngl 99 -ngld 99 \
+  -fa on \
+  --host 127.0.0.1 --port 8080
+```
+
+Repo helper scripts pick the right defaults per target (and prefer a
+quantized assistant under `.scratch/` when one exists):
+
+```bash
+# Dense targets.
+scripts/run-gemma4-mtp-server.sh         # 26B-A4B
+scripts/run-gemma4-31b-mtp-server.sh     # 31B
+
+# Edge / centroid-head targets — MTP_PRESET=throughput|lift|balanced|quality.
+MTP_PRESET=throughput scripts/run-gemma4-e4b-mtp-server.sh
+MTP_PRESET=throughput scripts/run-gemma4-e2b-mtp-server.sh
+```
+
+### Bench snapshot (Apple M4 Max, 48 GB, Metal, single slot)
+
+Median tps over 3 runs with Q4_K_S assistant heads, `--draft-block-size 3`
+(see `.scratch/bench-logs/matrix-q4chat.log`):
+
+| model | mode | n=128 tps | n=512 tps | accept@128 | accept@512 |
+|---|---|---:|---:|---:|---:|
+| gemma-26B | f16-base | 81.5 | 83.1 | — | — |
+| gemma-26B | **f16-mtp** | **109.5** | **95.8** | 85.9 % | 68.9 % |
+| gemma-26B | turbo3-mtp | 81.9 | 72.2 | 82.3 % | 67.9 % |
+| gemma-31B | f16-base | 14.2 | 15.2 | — | — |
+| gemma-31B | **f16-mtp** | **20.2** | **17.3** | 88.0 % | 74.6 % |
+| gemma-31B | turbo3-mtp | 18.7 | 15.7 | 87.0 % | 70.8 % |
+
+### Knobs
+
+- `--draft-block-size B` — head emits `B - 1` tokens per round (default 4;
+  bench used 3).
+- `--mtp-head <path>` (preferred) / `-md <path>` (back-compat alias).
+- `LLAMA_MTP_SKIP_STREAK_THRESHOLD=N` — adaptive skip after `N` consecutive
+  zero-accept batches (off by default).
+- `LLAMA_PIPELINE_DEPTH2=0` — disable depth-2 overlap (A/B against sync).
+- `LLAMA_MTP_ACC_TRACE=1|<path>` — NDJSON tracer for per-iteration
+  draft / accept events.
+
+Full architecture (graph, KV-safety contract, async pipeline, server
+integration, trade-offs) and the longer benchmark history live in
+**[MTP.md](MTP.md)**. User-facing CLI flags are also documented in
+[docs/speculative.md](docs/speculative.md).
+
 ## TurboQuant — KV cache & weight compression
 
 > **Credits.** TurboQuant in this fork is built on top of the absolutely
@@ -481,35 +574,6 @@ To learn more about model quantization, [read this documentation](tools/quantize
     </details>
 
 - <details>
-    <summary>Enable TurboQuant KV cache compression (this fork)</summary>
-
-    Use a TurboQuant KV-cache type for both K and V — typically with
-    Flash-Attention enabled — to cut KV memory traffic and footprint at
-    long contexts. Recommended default is **`turbo3`** (3-bit, ~4.3× vs F16,
-    accelerated by `TurboFlash` on Metal and dedicated kernels on
-    CUDA / Vulkan / HIP).
-
-    ```bash
-    # ~4.3x KV compression vs F16, full GPU offload, Flash-Attn on.
-    llama-server -m model.gguf -c 32768 \
-      -ngl 99 -ctk turbo3 -ctv turbo3 -fa on
-    ```
-
-    Pick a stronger compression preset by stepping the bit-width:
-
-    ```bash
-    -ctk turbo2 -ctv turbo2   # 2-bit KV, ~6.4x vs F16 (highest compression)
-    -ctk turbo3 -ctv turbo3   # 3-bit KV, ~4.3x  (default sweet spot)
-    -ctk turbo4 -ctv turbo4   # 4-bit KV, ~3.8x  (highest accuracy / fallback)
-    ```
-
-    See the longer write-up [below](#turboquant-kv-cache--weight-compression)
-    for weight quantization (`TQ4_1S` / `TQ3_1S`) and the per-backend support
-    matrix.
-
-    </details>
-
-- <details>
     <summary>Enable Gemma 4 MTP speculative decoding (this fork)</summary>
 
     Pair a `gemma4` target with the official `gemma4_assistant` MTP head. The
@@ -558,6 +622,35 @@ To learn more about model quantization, [read this documentation](tools/quantize
     the latest matrix benchmark live in [MTP.md](MTP.md). User-facing CLI
     flags (`--spec-type`, `--draft-*`) are documented in
     [docs/speculative.md](docs/speculative.md).
+
+    </details>
+
+- <details>
+    <summary>Enable TurboQuant KV cache compression (this fork)</summary>
+
+    Use a TurboQuant KV-cache type for both K and V — typically with
+    Flash-Attention enabled — to cut KV memory traffic and footprint at
+    long contexts. Recommended default is **`turbo3`** (3-bit, ~4.3× vs F16,
+    accelerated by `TurboFlash` on Metal and dedicated kernels on
+    CUDA / Vulkan / HIP).
+
+    ```bash
+    # ~4.3x KV compression vs F16, full GPU offload, Flash-Attn on.
+    llama-server -m model.gguf -c 32768 \
+      -ngl 99 -ctk turbo3 -ctv turbo3 -fa on
+    ```
+
+    Pick a stronger compression preset by stepping the bit-width:
+
+    ```bash
+    -ctk turbo2 -ctv turbo2   # 2-bit KV, ~6.4x vs F16 (highest compression)
+    -ctk turbo3 -ctv turbo3   # 3-bit KV, ~4.3x  (default sweet spot)
+    -ctk turbo4 -ctv turbo4   # 4-bit KV, ~3.8x  (highest accuracy / fallback)
+    ```
+
+    See the longer write-up [above](#turboquant--kv-cache--weight-compression)
+    for weight quantization (`TQ4_1S` / `TQ3_1S`) and the per-backend support
+    matrix.
 
     </details>
 
