@@ -780,9 +780,10 @@ class ModelBase:
 
             old_dtype = data_torch.dtype
 
-            # convert any unsupported data types to float32
+            # convert any unsupported data types to float32 (keep integer buffers integer)
             if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+                if "masked_embedding.token_ordering" not in name:
+                    data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
             bid = None
@@ -795,6 +796,25 @@ class ModelBase:
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
+
+                # HF masked_embedding.centroids.weight is numpy-shaped [n_centroids, n_embd].
+                # GGUFWriter packs dimensions reversed vs numpy; that yields on-disk / loader dims [n_embd, n_centroids],
+                # matching llama.cpp create_tensor(..., {n_embd, n_c}). Do not transpose here (transpose breaks loader layout).
+                if new_name == gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.MTP_CENTROIDS] + ".weight":
+                    data = gguf.LazyNumpyTensor.to_eager(data)
+
+                # Centroid routing: vocab indices must stay I32 (quantize() only supports floats).
+                if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.MTP_TOKEN_ORDERING, bid):
+                    # NOTE: data can be LazyNumpyTensor; astype() on lazy object keeps zero-filled meta.
+                    # Force eager materialization first, then cast.
+                    data_eager = gguf.LazyNumpyTensor.to_eager(data)
+                    data_i32 = np.ascontiguousarray(data_eager.astype(np.int32, copy=False))
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data_i32.shape))}}}"
+                    logger.info(
+                        f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> I32, shape = {shape_str}"
+                    )
+                    self.gguf_writer.add_tensor(new_name, data_i32, raw_dtype=gguf.GGMLQuantizationType.I32)
+                    continue
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -1019,11 +1039,20 @@ class TextModel(ModelBase):
         else:
             self.hf_arch = ""
 
+        root_model_type = None
         if "text_config" in self.hparams:
-            # move the text_config to the root level
+            # HF nested text_config often sets architectures=null and model_type=gemma4_text, which would
+            # wipe the wrapper's Gemma4AssistantForCausalLM / gemma4_assistant metadata if merged naively.
+            root_arch = self.hparams.get("architectures")
+            root_model_type = self.hparams.get("model_type")
             self.hparams = {**self.hparams, **self.hparams["text_config"]}
+            if root_arch is not None and self.hparams.get("architectures") is None:
+                self.hparams["architectures"] = root_arch
 
-        self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
+        if root_model_type == "gemma4_assistant" and "num_hidden_layers" in self.hparams:
+            self.block_count = int(self.hparams["num_hidden_layers"])
+        else:
+            self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
         self.rope_parameters = self.hparams.get("rope_parameters", self.hparams.get("rope_scaling")) or {}
@@ -7788,6 +7817,67 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Gemma4AssistantForCausalLM")
+class Gemma4AssistantModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hp = self.hparams
+        self.gguf_writer.add_n_centroids(hp.get("num_centroids", 0))
+        self.gguf_writer.add_centroid_top_k(hp.get("centroid_intermediate_top_k", 0))
+        self.gguf_writer.add_n_embd_backbone(hp.get("backbone_hidden_size", 0))
+        self.gguf_writer.add_use_ordered_embeddings(hp.get("use_ordered_embeddings", False))
+        self.gguf_writer.add_attention_k_eq_v(hp.get("attention_k_eq_v", False))
+        # MTP head must be paired with this target architecture in llama.cpp
+        self.gguf_writer.add_requires_target_arch("gemma4")
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith("per_dim_scale") or name.endswith("layer_scalar"):
+            name = name + ".weight"
+
+        # Tied lm_head shares embed; skip standalone lm_head if present in checkpoint
+        if bid is None and name.endswith("lm_head.weight"):
+            return
+
+        # HF layout is [vocab, hidden_size]. Some checkpoints widen hidden to backbone_hidden_size; llama.cpp expects hidden_size (= text_config.hidden_size).
+        if bid is None and name == "model.embed_tokens.weight" and data_torch.ndim == 2:
+            hs = int(self.hparams["hidden_size"])
+            n_bb = int(self.hparams.get("backbone_hidden_size") or 0)
+            n_rows, n_cols = data_torch.shape
+            if n_rows > n_cols:
+                # [vocab, n_embd]
+                if n_cols > hs:
+                    logger.warning(f"gemma4_assistant: trimming embed_tokens weight columns {n_cols} -> {hs}")
+                    data_torch = data_torch[:, :hs].contiguous()
+            elif n_bb > 0 and n_cols > n_rows and n_rows >= n_bb and n_rows > hs:
+                # Mistaken GGML-ish [n_embd_padded, vocab]
+                logger.warning(f"gemma4_assistant: trimming embed_tokens weight rows {n_rows} -> {hs}")
+                data_torch = data_torch[:hs, :].contiguous()
+
+        if name == "pre_projection.weight":
+            # HF Linear (out, in) = (n_embd, 2*n_bb); GGUF / ggml mul_mat expects w ne [2*n_bb, n_embd]
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_PRE_PROJECTION), data_torch)
+            return
+        if name == "post_projection.weight":
+            # HF (n_bb, n_embd); GGUF ne [n_embd, n_bb] for mul_mat(h, w) with h [n_embd, ...]
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_POST_PROJECTION), data_torch)
+            return
+        if name.endswith("masked_embedding.centroids.weight"):
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_CENTROIDS), data_torch)
+            return
+        if "masked_embedding.token_ordering" in name:
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_TOKEN_ORDERING), data_torch.to(torch.int32))
+            return
+
+        # Gemma4Model.modify_tensors expects a language_model.* prefix on HF names
+        lm_name = name
+        if name.startswith("model.") and not name.startswith("language_model."):
+            lm_name = "language_model." + name
+
+        yield from super().modify_tensors(data_torch, lm_name, bid)
+
+
 @ModelBase.register("Gemma4ForConditionalGeneration")
 class Gemma4VisionAudioModel(MmprojModel):
     has_audio_encoder = True
@@ -13057,6 +13147,8 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        torch.int32: np.int32,
+        torch.int64: np.int64,
     }
 
     # only used when byteswapping data. Only correct size is needed

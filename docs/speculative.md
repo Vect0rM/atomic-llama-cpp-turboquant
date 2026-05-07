@@ -13,6 +13,133 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### Gemma 4 MTP assistant (`mtp`)
+
+For **Gemma 4** targets with the **gemma4_assistant** (MTP head) GGUF, use `--spec-type mtp`. The assistant is **not** a second `llama_context`: weights are loaded into the target model via `llama_model_load_mtp_from_file` (done automatically when using the server/CLI init path). Cross-attention in the MTP graph reads **K/V from the target KV cache** (shared full/sliding layers).
+
+- Prefer **`--mtp-head /path/to/assistant.gguf`** for clarity; **`--model-draft` (`-md`)** is accepted as a backward-compatible alias (same path field).
+- The draft block size \(B\) is **`--draft-block-size`** (the head proposes `B - 1` tokens per round; default 4).
+- **`--gpu-layers-draft` / `-ngld`** and **`-ctkd` / `-ctvd`** still apply to how the **assistant tensors** are placed and typed when the assistant GGUF is loaded; the target uses `-ngl` and `-ctk`/`-ctv`.
+
+Example (paths illustrative). **TurboQuant** KV on the target: `-ctk`/`-ctv`. Assistant-side cache types follow the draft flags if you use them for offload/quant selection.
+
+```sh
+llama-server \
+  -m /path/to/gemma-4-target.gguf \
+  --mtp-head /path/to/gemma-4-assistant.gguf \
+  --spec-type mtp \
+  --draft-block-size 4 \
+  -c 16384 \
+  -ngl 99 -ngld 99 \
+  -ctk turbo3 -ctv turbo3 \
+  -ctkd turbo3 -ctvd turbo3 \
+  -fa on \
+  --host 127.0.0.1 --port 8080
+```
+
+Repo helper (defaults under `.scratch/`): `scripts/run-gemma4-mtp-server.sh`.
+
+#### Async MTP draft pipeline
+
+The MTP draft head runs on a dedicated `ggml_backend_sched` (`sched_mtp`) and a
+worker thread, isolated from the target's scheduler. This is exposed via two C
+APIs:
+
+```c
+LLAMA_API int32_t llama_decode_mtp_async(
+        struct llama_context * ctx,
+        llama_seq_id  seq_id,
+        llama_pos     attn_pos,
+        llama_token   last_token,
+        const float * h_prev,
+        int32_t       n_steps);
+
+LLAMA_API int32_t llama_decode_mtp_wait(
+        struct llama_context * ctx,
+        llama_token * out_drafts,
+        float       * out_h_prev_last);
+```
+
+Contract:
+
+- At most **one in-flight request per context**. Calling `_async` while a
+  previous request has not been waited on returns `-7`.
+- `h_prev` is copied into the request, so the caller may free or reuse it
+  immediately after `_async` returns.
+- Target KV positions ≤ `attn_pos` must remain stable until `_wait` returns.
+  The current append-only KV cache satisfies this as long as no eviction or
+  overlapping `seq_rm` happens between submit and wait.
+- `llama_decode_mtp(...)` is preserved as a backward-compatible synchronous
+  facade (= `_async` immediately followed by `_wait`).
+
+Why use the async pair?
+
+- **Graph-cache isolation**: MTP graph reuse is no longer invalidated by target
+  decode resets. On Gemma 4 + Q4_K_XL, this alone delivered **~+8% throughput**
+  in single-slot benchmarks (95.3 → 102.8 tps at `--draft-block-size 3`), with
+  identical accept rate.
+- **Pipeline depth-2 (pure overlap, `llama-server`)**: after target
+  sample/accept and `llama_memory_seq_rm`, the server calls
+  `common_speculative_prepare_next(spec, last_accepted_token)`, which submits
+  `llama_decode_mtp_async` for the *next* round. The blocking
+  `llama_decode_mtp_wait` is deferred to the start of the next
+  `common_speculative_draft`, so MTP work can overlap with post-accept
+  bookkeeping and token I/O. This uses the real sampled token (no optimistic
+  guess). **KV contract**: submit uses `attn_pos` after `seq_rm`; the next
+  `llama_decode` appends only positions `> attn_pos`, so backbone cells read by
+  MTP remain stable until `_wait` (append-only cache). Stale in-flight requests
+  are drained in `common_speculative_begin` and on skip / param-mismatch paths.
+- **In-graph argmax**: the MTP graph publishes a `ggml_argmax` of the final
+  logits (I32 [1]) via `llm_graph_result::get_argmax()`. Per draft step the host
+  reads back 4 bytes (one token id) instead of the full F32 [n_vocab] logits
+  row, and the serial CPU argmax over `n_vocab` is gone. The full logits are
+  still computed in-graph and can be fetched on demand by passing a non-null
+  `out_logits` to the synchronous `llama_decode_mtp(...)` API (diagnostic /
+  legacy path). On Gemma 4 + Q4_K_XL this delivered an additional **~+2-3%
+  throughput** (`109.5 → 112.5 tps` at `n=128`, `95.8 → 97.8 tps` at `n=512`),
+  with bit-identical greedy drafts.
+- **Future work**: optimistic last-token prediction could hide an additional
+  `llama_decode` latency on hits but risks wrong drafts on misses.
+
+#### Diagnostic: per-draft acceptance trace
+
+Set `LLAMA_MTP_ACC_TRACE` to enable a per-iteration NDJSON tracer in
+`common/speculative.cpp`. Each `mtp_draft` event records `iter`, `path`
+(`sync` / `lazy` / `skip-streak` / `skip-nsteps`), `seq_id`, `id_last`,
+`h_idx`, `attn_pos`, `n_steps`, `h_l2` (L2 norm of the input hidden state),
+and the drafted token ids; each `mtp_accept` event records the iteration
+counter, `n_accepted`, and `n_drafted_prev`. The host can pair them by `iter`
+to reconstruct per-position acceptance, MTP h_prev stability, and
+selection-bias breakdowns by `h_idx`.
+
+```sh
+# write trace to stderr
+LLAMA_MTP_ACC_TRACE=1 ./llama-server [...]
+# write trace to a file
+LLAMA_MTP_ACC_TRACE=/tmp/mtp.ndjson ./llama-server [...]
+```
+
+#### Throughput tuning (Edge assistants / heavy backends)
+
+Ordered-embeddings MTP (`use_ordered_embeddings`) runs a centroid LM head (`top_k`, routed `get_rows`) per draft step; the greedy graph still materializes a full-vocab logits row (masked fill + scatter) so argmax and optional full-row export stay consistent with verify.
+
+- **`LLAMA_MTP_SKIP_STREAK_THRESHOLD`**: **off by default** (`0` / unset). If set to `1`–`32`, after that many consecutive batches with **zero** accepted **MTP** drafts, MTP drafting is skipped for one verify-only batch, then retried.
+- Helper scripts `scripts/run-gemma4-e4b-mtp-server.sh` and `scripts/run-gemma4-e2b-mtp-server.sh` support **`MTP_PRESET`**: `throughput` (block 2 / max 6), `lift` (block 3 / max 8), `balanced`, or `quality`. Override with `DRAFT_BLOCK_SIZE`, `DRAFT_MAX`, and optionally `LLAMA_MTP_SKIP_STREAK_THRESHOLD`.
+
+Disabled at zero overhead (no env var or value `0` / empty); when enabled the
+extra cost is one `n_bb`-wide L2 reduction per draft and a small NDJSON write.
+
+#### Reconverting `gemma4_assistant` from Hugging Face
+
+Example (paths relative to repo root):
+
+```sh
+python convert_hf_to_gguf.py .scratch/gemma-4-26B-A4B-it-assistant \
+  --outfile .scratch/gemma-assistant-mtp.gguf --outtype f16
+```
+
+Use the resulting GGUF as `--mtp-head` (or `-md`) with `--spec-type mtp`. Older assistant GGUFs with `token_embd.weight` first axis 2816 (backbone width) instead of 1024 will fail load; run `scripts/verify-gemma4-assistant-gguf.py` on the file to check.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

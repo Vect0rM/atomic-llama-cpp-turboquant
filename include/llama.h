@@ -492,6 +492,20 @@ extern "C" {
                                  size_t    n_paths,
               struct llama_model_params    params);
 
+    // Gemma 4 MTP: load gemma4_assistant GGUF into a gemma4 target (call after llama_model_load_from_file, before llama_init_from_model).
+    // Returns 0 on success.
+    LLAMA_API int llama_model_load_mtp_from_file(
+            struct llama_model * model,
+            const char * path_mtp,
+            struct llama_model_params params);
+
+    LLAMA_API const struct llama_model * llama_model_get_mtp_assistant(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_has_mtp_assistant(const struct llama_model * model);
+
+    // Backbone hidden size for MTP input (0 if no MTP assistant is loaded).
+    LLAMA_API uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model);
+
     LLAMA_API void llama_model_save_to_file(
             const struct llama_model * model,
                         const char * path_model);
@@ -586,6 +600,16 @@ extern "C" {
 
     // Returns label of classifier output by index (<n_cls_out). Returns nullptr if no label provided
     LLAMA_API const char * llama_model_cls_label(const struct llama_model * model, uint32_t i);
+
+    // GGUF "general.architecture" string for the model (e.g. "gemma4", "gemma4_assistant")
+    LLAMA_API const char * llama_model_arch_str(const struct llama_model * model);
+
+    // Copy one token embedding row as f32. Supported for F32/F16 token_embd only. Returns row width or -1.
+    LLAMA_API int32_t llama_model_token_embd_row_f32(
+            const struct llama_model * model,
+            llama_token token,
+            float * out,
+            int32_t n_out);
 
     LLAMA_API enum llama_vocab_type llama_vocab_type(const struct llama_vocab * vocab);
 
@@ -963,6 +987,48 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Gemma 4 MTP: run up to n_steps greedy assistant steps using target KV and last hidden state.
+    // h_prev must hold n_embd_backbone floats on input; overwritten with the last step's projected hidden on success.
+    // out_logits may be NULL or a row-major buffer of shape [n_steps, n_vocab].
+    // out_h_prev_last may be NULL; if set, receives the same final h as h_prev.
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
+
+    // Async MTP draft pipeline (see plan async-mtp-pipeline). Submits a draft request
+    // to a dedicated worker thread that runs the MTP graph on its own ggml_backend_sched.
+    // This lets the main thread proceed with target verify while MTP encodes in parallel.
+    //
+    // Contract:
+    //   - At most one in-flight request per context. Submitting a second _async without
+    //     calling _wait first returns -7 (and leaves the previous request in flight).
+    //   - h_prev must hold n_embd_backbone floats; the buffer is copied into the request,
+    //     so the caller may free or modify it after _async returns.
+    //   - The caller must guarantee that target KV positions ≤ attn_pos remain stable
+    //     until _wait returns. With the current append-only KV cache this is implicitly
+    //     true as long as no cache eviction is triggered between _async and _wait.
+    LLAMA_API int32_t llama_decode_mtp_async(
+            struct llama_context * ctx,
+            llama_seq_id  seq_id,
+            llama_pos     attn_pos,
+            llama_token   last_token,
+            const float * h_prev,
+            int32_t       n_steps);
+
+    // Block until the in-flight MTP request completes. Copies up to n_steps drafts into
+    // out_drafts and the last hidden state into out_h_prev_last (may be NULL).
+    LLAMA_API int32_t llama_decode_mtp_wait(
+            struct llama_context * ctx,
+            llama_token * out_drafts,
+            float       * out_h_prev_last);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1008,6 +1074,10 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Dense LM-head logits row for batch position i ([n_vocab], no backend sampling view).
+    // Prefer this for greedy speculative verification; llama_get_logits_ith() may return
+    // sparse / backend-sampled buffers that change argmax.
+    // Returns NULL if logits are unavailable for this index.
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
