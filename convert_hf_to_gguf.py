@@ -780,9 +780,10 @@ class ModelBase:
 
             old_dtype = data_torch.dtype
 
-            # convert any unsupported data types to float32
+            # convert any unsupported data types to float32 (keep integer buffers integer)
             if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+                if "masked_embedding.token_ordering" not in name:
+                    data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
             bid = None
@@ -795,6 +796,25 @@ class ModelBase:
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
+
+                # HF masked_embedding.centroids.weight is numpy-shaped [n_centroids, n_embd].
+                # GGUFWriter packs dimensions reversed vs numpy; that yields on-disk / loader dims [n_embd, n_centroids],
+                # matching llama.cpp create_tensor(..., {n_embd, n_c}). Do not transpose here (transpose breaks loader layout).
+                if new_name == gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.MTP_CENTROIDS] + ".weight":
+                    data = gguf.LazyNumpyTensor.to_eager(data)
+
+                # Centroid routing: vocab indices must stay I32 (quantize() only supports floats).
+                if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.MTP_TOKEN_ORDERING, bid):
+                    # NOTE: data can be LazyNumpyTensor; astype() on lazy object keeps zero-filled meta.
+                    # Force eager materialization first, then cast.
+                    data_eager = gguf.LazyNumpyTensor.to_eager(data)
+                    data_i32 = np.ascontiguousarray(data_eager.astype(np.int32, copy=False))
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data_i32.shape))}}}"
+                    logger.info(
+                        f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> I32, shape = {shape_str}"
+                    )
+                    self.gguf_writer.add_tensor(new_name, data_i32, raw_dtype=gguf.GGMLQuantizationType.I32)
+                    continue
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -13127,6 +13147,8 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        torch.int32: np.int32,
+        torch.int64: np.int64,
     }
 
     # only used when byteswapping data. Only correct size is needed
