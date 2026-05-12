@@ -667,6 +667,15 @@ private:
     const llama_model & model;
 };
 
+// Qwen3.6 NextN draft head (standalone context, KV on tail layers only; GGUF arch: qwen35_mtp / qwen35moe_mtp)
+struct llm_build_qwen35_nextn : public llm_graph_context {
+    llm_build_qwen35_nextn(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_qwen35moe_nextn : public llm_graph_context {
+    llm_build_qwen35moe_nextn(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_qwen : public llm_graph_context {
     llm_build_qwen(const llama_model & model, const llm_graph_params & params);
 };

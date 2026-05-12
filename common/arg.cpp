@@ -3492,7 +3492,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg(
         {"-md", "--model-draft"}, "FNAME",
-        "draft model for speculative decoding, or Gemma 4 MTP assistant GGUF when using --spec-type mtp (default: unused)",
+        "draft model for speculative decoding, Gemma 4 MTP assistant GGUF when using --spec-type mtp, or same main-model GGUF for Qwen NextN with --spec-type nextn (default: unused)",
         [](common_params & params, const std::string & value) {
             params.speculative.mparams_dft.path = value;
         }
@@ -3512,8 +3512,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|draft|mtp|eagle3|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type mtp and --mtp-head (or --model-draft) pointing at gemma4_assistant GGUF.\n",
+        {"--spec-type"}, "[none|draft|mtp|nextn|eagle3|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type mtp and --mtp-head (or --model-draft) pointing at gemma4_assistant GGUF. For Qwen3 NextN use --spec-type nextn and --model-draft with the same GGUF as the target (second load uses llama_model_params.override_arch).\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
@@ -3522,6 +3522,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;
             } else if (value == "mtp") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
+            } else if (value == "nextn") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NEXTN;
             } else if (value == "eagle3") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_EAGLE3;
             } else if (value == "ngram-cache") {

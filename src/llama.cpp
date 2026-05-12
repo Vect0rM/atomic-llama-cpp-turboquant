@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -853,6 +854,19 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
             model.load_arch(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
+        }
+        if (params.override_arch && params.override_arch[0] != '\0') {
+            const llm_arch arch_ov = llm_arch_from_string(std::string(params.override_arch));
+            if (arch_ov == LLM_ARCH_UNKNOWN) {
+                throw std::runtime_error(std::string("override_arch: unknown architecture '") + params.override_arch + "'");
+            }
+            LLAMA_LOG_INFO("%s: override_arch: '%s' -> '%s'\n", __func__,
+                    llm_arch_name(model.arch), params.override_arch);
+            model.arch = arch_ov;
+            // Combined GGUFs (e.g. Qwen3.6 *_MTP.gguf) hold both the full target
+            // backbone and the NextN draft head. When this loader is used to
+            // mount only the draft view, allow the file to retain unused tensors.
+            ml.partial_load = true;
         }
         try {
             model.load_hparams(ml);

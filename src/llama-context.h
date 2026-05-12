@@ -5,7 +5,6 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
-
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
@@ -19,6 +18,13 @@
 
 struct llama_model;
 class llama_batch_allocr;
+
+struct llama_context;
+
+// Qwen NextN: non-owning draft context for paired KV seq_rm (drafting uses embeddings_pre_norm buffers).
+struct llama_nextn {
+    llama_context * ctx_nextn = nullptr;
+};
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -84,6 +90,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    float * get_embeddings_pre_norm();
+    float * get_embeddings_pre_norm_ith(int32_t i);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -107,6 +116,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_embeddings_pre_norm(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -186,6 +196,13 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // Qwen NextN: secondary draft context (same GGUF as target; separate ctx). Used for paired KV seq_rm.
+    void set_nextn(llama_context * ctx_nextn_in);
+
+    llama_context * get_nextn() const {
+        return nextn.ctx_nextn;
+    }
 
     //
     // state save/load
@@ -330,6 +347,8 @@ private:
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
 
+    buffer_view<float> embd_pre_norm = {nullptr, 0};
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -392,6 +411,8 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    llama_nextn nextn;
 
     // Async MTP pipeline (Phase C of async-mtp-pipeline plan).
     // sched_mtp is a dedicated scheduler so the MTP draft graph can be encoded on a

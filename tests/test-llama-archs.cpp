@@ -325,6 +325,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN35MOE_NEXTN:
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_OLMOE:
@@ -413,6 +414,10 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
+
+    if (arch == LLM_ARCH_QWEN35_NEXTN || arch == LLM_ARCH_QWEN35MOE_NEXTN) {
+        return false; // NextN-only graphs: integration via same-GGUF second load + llama_set_nextn
+    }
 
     return true;
 }

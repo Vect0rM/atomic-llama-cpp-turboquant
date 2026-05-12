@@ -178,6 +178,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_MTP,           // Gemma 4 MTP assistant drafter
+    COMMON_SPECULATIVE_TYPE_NEXTN,         // Qwen3.x NextN second-context draft (same GGUF, arch override)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 

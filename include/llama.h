@@ -312,6 +312,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // if non-NULL, replace architecture from GGUF after read (e.g. load same file as qwen35_mtp for NextN draft)
+        const char * override_arch;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -1030,6 +1033,19 @@ extern "C" {
             struct llama_context * ctx,
             llama_token * out_drafts,
             float       * out_h_prev_last);
+
+    // Qwen NextN (second-context draft): pair target `ctx` with a draft head context built from the same GGUF.
+    // Gemma 4 MTP APIs above are unchanged.
+    LLAMA_API void llama_set_nextn(
+            struct llama_context * ctx_target,
+            struct llama_context * ctx_nextn);
+
+    // Remove KV on both target and NextN draft contexts (draft uses seq_id 0).
+    LLAMA_API bool llama_context_nextn_seq_rm(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              p0,
+            llama_pos              p1);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
