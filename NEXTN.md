@@ -14,6 +14,44 @@ See also `MTP.md` (Gemma) and `docs/speculative.md` for shared CLI concepts.
 
 ---
 
+## 0. Pre-built model GGUFs
+
+Recommended source for Qwen 3.6 combined `*_MTP.gguf` checkpoints is the
+**unsloth** Hugging Face collection — the same files exercised in the
+matrix bench (§7):
+
+| Target | Combined `_MTP.gguf` (target + NextN head) | Recommended quant | Architecture |
+|---|---|---|---|
+| Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | **`UD-Q4_K_XL`** (22.9 GB) | `qwen35moe` |
+| Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | **`UD-Q4_K_XL`** | `qwen35` |
+
+Both repos ship `UD-IQ1_M` … `BF16` quants. The shared-model NextN path
+works on **any** of them as long as the file contains the NextN auxiliary
+head (`nextn_predict_layers > 0`) — which all `*-MTP-GGUF` quants do by
+construction. `scripts/verify-qwen36-nextn-gguf.py` will refuse to load a
+file missing the NextN layer.
+
+Quick pull via `-hf` (target) + `-hfd` (draft); the server resolves both to
+the same file in the HF cache and takes the shared-model branch:
+
+```bash
+# 35B-A3B MoE (headline +24-36 % cell in the matrix)
+llama-server \
+  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  --spec-type nextn --draft-max 2 --draft-min 1 \
+  -c 8192 -ngl 99 -ngld 99 -fa on
+
+# 27B dense
+llama-server \
+  -hf  unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  -hfd unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  --spec-type nextn --draft-max 2 --draft-min 1 \
+  -c 8192 -ngl 99 -ngld 99 -fa on
+```
+
+---
+
 ## 1. Architecture
 
 | Piece | Role |
@@ -76,35 +114,80 @@ PYTHONPATH=gguf-py python3 scripts/verify-qwen36-nextn-gguf.py /path/to/model.gg
 - `scripts/run-qwen36-27b-nextn-server.sh`
 - `scripts/run-qwen36-35ba3b-nextn-server.sh`
 
-Set `MAIN_GGUF` to your Qwen3.6 GGUF; draft defaults to the same path.
+Set `MAIN_GGUF` to your Qwen3.6 `*_MTP.gguf` (see §0 for the recommended
+unsloth quants); draft defaults to the same path so the server takes the
+shared-model branch. Alternatively use `-hf` (target) + `-hfd` (draft) to
+let `llama-server` pull both from Hugging Face into the local cache:
+
+```bash
+llama-server \
+  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  --spec-type nextn --draft-max 2 --draft-min 1
+```
 
 ---
 
-## 7. Performance notes (Apple M4 Max, Metal)
+## 7. Performance notes (MacBook Pro M4 Max, 40-core GPU, 48 GB, Metal)
 
 Median TPS over 3 runs, prompt = 50-token instruction, `--draft-max=2 --draft-min=1`,
-NextN draft DM=2 (single async chain), context 8192. See `.scratch/bench-logs/qwen-matrix-shared-*.md`.
+NextN draft DM=2 (single async chain), context 8192. Single-slot
+(`--parallel 1 -np 1 --cont-batching`), full GPU offload (`-ngl 99 -ngld 99 -fa on`),
+shared-model draft path (no second mmap of combined `_MTP.gguf`). See
+`.scratch/bench-logs/qwen-matrix-fullrun-20260512-222625.md`.
 
-| model | mode | short tps (n=128) | long tps (n=512) | accept (long) | Δ vs base (long) |
-|---|---|---:|---:|---:|---:|
-| qwen-27B dense | f16-base | 20.82 | 20.49 | — | — |
-| qwen-27B dense | f16-nextn | 20.33 | 18.93 | 72.0% | **−7.6%** |
-| qwen-27B dense | turbo3-base | 18.41 | 17.85 | — | — |
-| qwen-27B dense | turbo3-nextn | 17.88 | 15.72 | 65.4% | **−11.9%** |
-| qwen-35B-A3B MoE | f16-base | 69.31 | 69.30 | — | — |
-| qwen-35B-A3B MoE | f16-nextn | 91.86 | 83.63 | 66.1% | **+20.7%** |
-| qwen-35B-A3B MoE | turbo3-base | 62.46 | 61.97 | — | — |
-| qwen-35B-A3B MoE | turbo3-nextn | 84.91 | 78.41 | 67.7% | **+26.5%** |
+### Bench host
 
-**Where NextN helps**: MoE targets (qwen-35B-A3B) — verify is heavy enough that the draft
-compute fully overlaps via the async pipeline. Wins range from **+20% (f16, long)** to
-**+36% (turbo3, short)**.
+| Component | Value |
+|---|---|
+| Machine | MacBook Pro (`Mac16,5`, MX313LL/A) |
+| SoC | Apple **M4 Max** — 16 CPU cores (12P + 4E), **40-core GPU** |
+| Unified memory | **48 GB** LPDDR5 |
+| OS | macOS 26.3.1 (build 25D2128), Darwin 25.3.0 |
+| llama.cpp backend | Metal (full GPU offload: `-ngl 99 -ngld 99`, `-fa on`) |
+| Server | local `llama-server` over `127.0.0.1:8080` |
+| Client | `python3 urllib` → `/v1/chat/completions`, `temperature=0`, `cache_prompt=false`, `stream=false` |
+| Driver | `scripts/bench-matrix-qwen.sh` (3 runs/cell, median tps, mean accept) |
 
-**Known limitation: 27B dense NextN draft is draft-compute-bound.** The NextN-layer is a
-full transformer block, so on a dense model `t_draft ≈ 2.6× t_verify`. The async pipeline
-cannot overlap that fully → speculative wins are negative or paritetical. turbo3 KV
-quantization adds another **~7%** to draft compute (Metal dequant overhead inside the
-NextN attention), pushing 27B turbo3-nextn long to **−12%** vs baseline. This is not a bug:
-isolated diagnostics (`accept_token` 71.2% f16 ≈ 71.5% turbo3 — H1/H3 rejected,
-`t_draft` 1354 → 1449 ms — H4 partially confirmed) point to physical compute limits on
-M4 Max. Stick to f16 KV when running NextN on dense Qwen3.6 27B if every percent matters.
+Single-slot configuration (`--parallel 1 -np 1 --cont-batching`); no other
+heavy GPU/CPU workloads were running on the host during the matrix sweep.
+
+| model | mode | short tps (n=128) | long tps (n=512) | short accept | long accept | Δ short | Δ long |
+|---|---|---:|---:|---:|---:|---:|---:|
+| qwen-27B dense | f16-base       | 21.34 | 20.82 | — | — | — | — |
+| qwen-27B dense | f16-nextn      | **22.86** | **21.57** | 93.9% | 85.1% | **+7.1%** | **+3.6%** |
+| qwen-27B dense | turbo3-base    | 19.71 | 18.74 | — | — | — | — |
+| qwen-27B dense | turbo3-nextn   | **20.75** | **19.73** | 85.5% | 78.7% | **+5.3%** | **+5.3%** |
+| qwen-35B-A3B MoE | f16-base     | 70.09 | 69.63 | — | — | — | — |
+| qwen-35B-A3B MoE | f16-nextn    | **95.22** | **89.13** | 88.2% | 78.7% | **+35.8%** | **+28.0%** |
+| qwen-35B-A3B MoE | turbo3-base  | 61.84 | 62.01 | — | — | — | — |
+| qwen-35B-A3B MoE | turbo3-nextn | **82.73** | **77.20** | 82.9% | 80.6% | **+33.8%** | **+24.5%** |
+
+**Where NextN helps the most: MoE targets (qwen-35B-A3B).** Verify is heavy enough that the
+draft compute fully overlaps via the async pipeline; acceptance stays high (≥78%) at both
+prompt lengths. Wins range from **+24% (turbo3, long)** to **+36% (f16, short)**, on top of
+the +13% TurboQuant memory-bandwidth lift from `turbo3` KV.
+
+**Dense 27B is draft-compute-bound but no longer regresses.** The NextN-layer is a full
+transformer block; on a dense model `t_draft ≈ 2.6× t_verify`, so the async pipeline cannot
+overlap it fully and the upside is bounded by accept-rate × `(t_verify / (t_verify + non-overlapped t_draft))`.
+With the shared-model draft path (no double mmap, no graph rebuilds across submits) we land
+at **+5-7% across short/long, both KV typings** — modest but consistent, and *positive*
+where the previous double-mmap path was negative (the old `qwen-matrix-shared` matrix logged
+−7.6% / −11.9% on long for f16-nextn / turbo3-nextn respectively). `turbo3` KV adds ~5% extra
+draft compute on this rig (Metal dequant inside NextN attention) but it is hidden in the
+overlap and TurboQuant's bandwidth win covers the rest.
+
+### History within this branch (27B regression resolved)
+
+| Bench log (mtime) | Path | 27B f16-nextn long (Δ vs f16-base) | 27B turbo3-nextn long (Δ vs turbo3-base) | Note |
+|---|---|---:|---:|---|
+| `qwen-matrix-shared-20260512-202358.md` | double mmap | −7.6 % (18.93 vs 20.49) | −11.9 % (15.72 vs 17.85) | 35B-A3B OOM on long prompts |
+| `qwen-matrix-fullrun-20260512-222625.md` | shared model | **+3.6 % (21.57 vs 20.82)** | **+5.3 % (19.73 vs 18.74)** | this matrix |
+
+The jump came from a single architectural change: dropping the second
+`llama_model_load_from_file` and reusing the target's already-loaded NextN tensors via
+`cparams.nextn_draft = true`. Side-effects: (a) 22 GB second `MTLBuffer` gone — 35B-A3B MoE
+now runs without OOM and posts +24-36%; (b) draft KV cache resized only for the NextN layer
+(`kv_only_nextn = true` is mutated transparently in `llama_context` ctor for draft); (c) the
+NextN graph builder now flows through `LLM_GRAPH_TYPE_NEXTN` instead of `override_arch`.

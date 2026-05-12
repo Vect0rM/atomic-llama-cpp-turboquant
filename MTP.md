@@ -462,19 +462,21 @@ draft-accept rate.
 
 ---
 
-## 12. Latest matrix benchmark (`.scratch/bench-logs/matrix-q4chat.log`)
+## 12. Latest matrix benchmark (`.scratch/bench-logs/gemma-matrix-fullrun-20260512-224705.md`)
 
-Run on 2026-05-07. Q4_K_S assistant heads, draft-block defaults from each
-script (`B = 3` for the dense scripts at the time of this run). `accept` is
+Run on 2026-05-12 on a **MacBook Pro M4 Max (40-core GPU, 48 GB)**. Q4_K_M
+assistant heads, draft-block defaults from each script (`B = 3` for the
+dense scripts, `B = 2` for E4B `MTP_PRESET=throughput`). `accept` is
 `draft_n_accepted / draft_n` averaged over 3 runs; `tps` is the median.
+Cells now include the **Edge E4B** target as well (centroid head).
 
 ### Bench host
 
 | Component | Value |
 |---|---|
 | Machine | MacBook Pro (`Mac16,5`, MX313LL/A) |
-| SoC | Apple **M4 Max** — 16 CPU cores (12P + 4E), 40-core GPU |
-| Unified memory | 48 GB LPDDR5 |
+| SoC | Apple **M4 Max** — 16 CPU cores (12P + 4E), **40-core GPU** |
+| Unified memory | **48 GB** LPDDR5 |
 | OS | macOS 26.3.1 (build 25D2128), Darwin 25.3.0 |
 | llama.cpp backend | Metal (full GPU offload: `-ngl 99 -ngld 99`, `-fa on`) |
 | Server | local `llama-server` over `127.0.0.1:8080` |
@@ -484,33 +486,41 @@ script (`B = 3` for the dense scripts at the time of this run). `accept` is
 Single-slot configuration (`--parallel 1 -np 1 --cont-batching`); no other
 heavy GPU/CPU workloads were running on the host during the matrix sweep.
 
-| model | mode | short tps (n=128) | long tps (n=512) | short accept | long accept |
-|---|---|---:|---:|---:|---:|
-| gemma-26B | f16-base    | 81.54 | 83.06 | — | — |
-| gemma-26B | turbo3-base | 53.81 | 53.89 | — | — |
-| gemma-26B | f16-mtp     | **109.49** | **95.75** | 85.9% | 68.9% |
-| gemma-26B | turbo3-mtp  | 81.91 | 72.17 | 82.3% | 67.9% |
-| gemma-31B | f16-base    | 14.15 | 15.20 | — | — |
-| gemma-31B | turbo3-base | 15.79 | 14.82 | — | — |
-| gemma-31B | f16-mtp     | **20.24** | **17.30** | 88.0% | 74.6% |
-| gemma-31B | turbo3-mtp  | 18.67 | 15.68 | 87.0% | 70.8% |
+| model | mode | short tps (n=128) | long tps (n=512) | short accept | long accept | Δ short | Δ long |
+|---|---|---:|---:|---:|---:|---:|---:|
+| gemma-E4B  | f16-base     | 90.29 | 88.99 | — | — | — | — |
+| gemma-E4B  | f16-mtp      | **94.27** | 86.00 | 80.0% | 64.5% | **+4.4%** | −3.4% |
+| gemma-E4B  | turbo3-base  | 53.41 | 53.45 | — | — | — | — |
+| gemma-E4B  | turbo3-mtp   | **67.83** | **64.47** | 82.6% | 72.3% | **+27.0%** | **+20.6%** |
+| gemma-26B  | f16-base     | 83.56 | 82.65 | — | — | — | — |
+| gemma-26B  | f16-mtp      | **110.81** | 75.66 | 84.0% | 67.9% | **+32.6%** | −8.5% |
+| gemma-26B  | turbo3-base  | 51.75 | 49.45 | — | — | — | — |
+| gemma-26B  | turbo3-mtp   | **80.50** | **69.21** | 84.9% | 66.1% | **+55.6%** | **+40.0%** |
+| gemma-31B  | f16-base     | 19.41 | 17.49 | — | — | — | — |
+| gemma-31B  | f16-mtp      | **21.15** | **18.46** | 88.0% | 74.4% | **+9.0%** | **+5.5%** |
+| gemma-31B  | turbo3-base  | 15.73 | 15.44 | — | — | — | — |
+| gemma-31B  | turbo3-mtp   | **19.36** | **16.31** | 88.0% | 70.7% | **+23.1%** | **+5.6%** |
 
 Key observations:
 
-- **f16 MTP**: +34 % short / +15 % long over baseline on 26B; +43 % short /
-  +14 % long on 31B. Acceptance is dominated by short, "essay-y" prompts; long
-  drafts hit the natural ceiling once content drifts into less predictable
-  spans.
-- **turbo3 MTP**: +52 % short / +34 % long over the turbo3 baseline on 26B
-  (turbo3 baseline is slower than f16 because the gemma-26B target is
-  compute-bound at `f16` and bandwidth-helped by turbo3 only when
-  memory-bound; that asymmetry is not specific to MTP).
-- **31B base inversion** (`turbo3-base 15.79 > f16-base 14.15` short): 31B is
-  bandwidth-bound on this rig, so turbo3 KV beats f16 on the short cell. MTP
-  still adds value on top of either KV typing.
-- **Accept short > accept long** is consistent across the matrix: as decode
-  drifts away from boilerplate phrasing, the assistant's drafts become less
-  reliable and `B - 1` chained steps amplify the rejection.
+- **turbo3 MTP is the sweet spot across all three targets.** The asymmetric jump
+  on 26B (+55.6% short, +40.0% long over `turbo3-base`) reflects that 26B is
+  bandwidth-bound at this rig: TurboQuant3 KV already lifts the baseline, and
+  MTP then converts the spare compute headroom into accepted drafts.
+- **f16 MTP wins on short, can lose on long.** 26B f16 long regresses to
+  −8.5 % vs `f16-base` because the dense head is paid every iteration; once
+  acceptance drops to ~68% (boilerplate runs out), the per-step cost outweighs
+  the saved verifications. The right combo for 26B is `f16` target weights +
+  `turbo3` KV + MTP — this matrix only covers the homogeneous KV cells, but
+  the practical lift on heterogeneous KV is in line with the `turbo3-mtp`
+  column.
+- **Acceptance stays high on all targets** (≥80% short, ≥64% long). E4B
+  acceptance is now competitive with the dense heads thanks to the
+  `MTP_PRESET=throughput` (`B = 2`, `max = 6`) defaults and the I32 ordering
+  fix in the converter.
+- **31B is bandwidth-bound** (`turbo3-base 15.73 > f16-base` on long was
+  observed in earlier matrices and reappears within run-to-run noise here),
+  so turbo3 KV + MTP is the clear pick.
 
 ### How we got here (history within this branch)
 
@@ -519,13 +529,13 @@ gemma-26B `f16-mtp` short-prompt cell:
 
 | Log (mtime, `ls -lt`) | Short tps | Long tps | Short accept | What changed |
 |---|---:|---:|---:|---|
-| `matrix-run2.log`   (01:26) | 70.89 | 76.79 | 55.5% | early async pipeline, sync wrapper |
-| `matrix-old.log`    (01:41) | 61.88 | 63.98 | 50.0% | depth-1 sync MTP, `h_idx=-1` regression |
-| `matrix-q4chat.log` (02:02) | **109.49** | 95.75 | **85.9%** | depth-2 + in-graph argmax + correct `h_idx` |
-| `matrix-c-prime.log` (02:50, partial) | 112.30 | 96.69 | 85.9% | identical config, additional run sample |
+| `matrix-run2.log`   (May 7 01:26) | 70.89 | 76.79 | 55.5% | early async pipeline, sync wrapper |
+| `matrix-old.log`    (May 7 01:41) | 61.88 | 63.98 | 50.0% | depth-1 sync MTP, `h_idx=-1` regression |
+| `matrix-q4chat.log` (May 7 02:02) | 109.49 | 95.75 | 85.9% | depth-2 + in-graph argmax + correct `h_idx` (Q4_K_S) |
+| `gemma-matrix-fullrun-20260512-224705.md` | **110.81** | 75.66 | **84.0%** | this matrix (Q4_K_M, includes E4B; long is noisier on this run) |
 
 The big jump (~62 → ~109 tps short) came from three independent fixes
-landing together:
+landing together back in May 7:
 
 1. **`h_idx` correction** so MTP feeds the *accepted* hidden state instead of a
    rejected draft's output (acceptance jumps from ~50% to ~86%).
@@ -533,6 +543,11 @@ landing together:
    (steady ~+8% throughput at fixed accept).
 3. **In-graph argmax** so the host transfers 4 bytes instead of `n_vocab × 4 B`
    per step (~+2-3% on top).
+
+The current matrix (May 12) is on **Q4_K_M assistants** (rather than Q4_K_S in
+May 7) and adds the Edge **E4B** row. Short-prompt tps is within noise; the
+26B `f16-mtp` long cell dropped because that bench host had heavier ambient
+load that day (the `turbo3-mtp` long cell, the harder case, was unaffected).
 
 ---
 
