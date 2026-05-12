@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -947,6 +949,28 @@ struct common_speculative_state_nextn : public common_speculative_state {
     uint16_t last_n_drafted   = 0;
     int32_t  last_n_accepted  = -1;
 
+    // Async pipeline depth-2 (gated by LLAMA_PIPELINE_DEPTH2=0 to disable).
+    // Worker thread overlaps NextN draft compute on ctx_nextn with the
+    // server's per-token CPU work (sampling, tokenization, response build)
+    // between prepare_next() and the next draft() call.
+    bool pipeline_enabled = true;
+
+    std::thread             worker_thread;
+    std::mutex              pipe_mu;
+    std::condition_variable pipe_cv;
+    bool pipe_stop          = false;
+    bool pipe_req_pending   = false;
+    bool pipe_res_ready     = false;
+    bool pipe_has_pending   = false;     // submit-side flag (set by prepare_next, cleared by draft)
+    // Request data populated by prepare_next, consumed by worker.
+    llama_token         pipe_req_id_last  = -1;
+    int32_t             pipe_req_n_steps  = 0;
+    llama_pos           pipe_req_pos_start = 0;
+    std::vector<float>  pipe_req_embd;
+    // Result populated by worker, consumed by draft.
+    llama_tokens        pipe_res_drafts;
+    int32_t             pipe_res_actual_steps = 0; // how many decodes the worker actually completed
+
     common_speculative_state_nextn(enum common_speculative_type type, llama_context * ctx_tgt, llama_context * ctx_nextn_in)
             : common_speculative_state(type), ctx_tgt(ctx_tgt), ctx_nextn(ctx_nextn_in) {
         GGML_ASSERT(ctx_tgt && ctx_nextn);
@@ -971,9 +995,28 @@ struct common_speculative_state_nextn : public common_speculative_state {
         llama_set_embeddings_pre_norm(ctx_tgt, true);
         llama_set_embeddings_pre_norm(ctx_nextn, true);
         llama_set_nextn(ctx_tgt, ctx_nextn);
+
+        if (const char * v = std::getenv("LLAMA_PIPELINE_DEPTH2")) {
+            if (std::strcmp(v, "0") == 0) {
+                pipeline_enabled = false;
+            }
+        }
+        if (pipeline_enabled) {
+            worker_thread = std::thread([this] { worker_loop(); });
+        }
     }
 
     ~common_speculative_state_nextn() override {
+        if (pipeline_enabled) {
+            {
+                std::lock_guard<std::mutex> lk(pipe_mu);
+                pipe_stop = true;
+                pipe_cv.notify_all();
+            }
+            if (worker_thread.joinable()) {
+                worker_thread.join();
+            }
+        }
         llama_set_embeddings_pre_norm(ctx_tgt, false);
         llama_set_embeddings_pre_norm(ctx_nextn, false);
         llama_set_nextn(ctx_tgt, nullptr);
@@ -982,6 +1025,94 @@ struct common_speculative_state_nextn : public common_speculative_state {
         if (ctx_nextn) {
             llama_free(ctx_nextn);
             ctx_nextn = nullptr;
+        }
+    }
+
+    // Worker loop: blocks on pipe_cv, runs draft chain on ctx_nextn, publishes result.
+    void worker_loop() {
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        std::vector<float> local_embd;
+        for (;;) {
+            llama_token id_last  = 0;
+            int32_t     n_steps  = 0;
+            llama_pos   pos_start = 0;
+            {
+                std::unique_lock<std::mutex> lk(pipe_mu);
+                pipe_cv.wait(lk, [this] { return pipe_req_pending || pipe_stop; });
+                if (pipe_stop) {
+                    return;
+                }
+                id_last   = pipe_req_id_last;
+                n_steps   = pipe_req_n_steps;
+                pos_start = pipe_req_pos_start;
+                local_embd.swap(pipe_req_embd);
+                pipe_req_pending = false;
+            }
+
+            llama_tokens drafts;
+            int32_t actual_steps = 0;
+            llama_token cond_tok = id_last;
+            llama_pos   pos      = pos_start;
+
+            for (int32_t k = 0; k < n_steps; ++k) {
+                const float * src = nullptr;
+                if (k == 0) {
+                    src = local_embd.data();
+                } else {
+                    llama_synchronize(ctx_nextn);
+                    src = llama_get_embeddings_pre_norm_ith(ctx_nextn, -1);
+                }
+                if (!src) {
+                    break;
+                }
+                std::memcpy(batch.embd, src, row_bytes);
+                batch.token[0] = cond_tok;
+                batch.pos[0]   = pos;
+
+                if (llama_decode(ctx_nextn, batch) != 0) {
+                    break;
+                }
+                ++actual_steps;
+                const llama_token best = common_sampler_sample(smpl, ctx_nextn, 0);
+                common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
+
+                drafts.push_back(best);
+                cond_tok = best;
+                ++pos;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(pipe_mu);
+                pipe_res_drafts       = std::move(drafts);
+                pipe_res_actual_steps = actual_steps;
+                pipe_res_ready        = true;
+                pipe_cv.notify_all();
+            }
+        }
+    }
+
+    // Drain in-flight worker request (block until completion) and discard result.
+    // Rolls back ctx_nextn KV by the number of steps the worker actually committed.
+    void drain_pending_and_rollback() {
+        if (!pipe_has_pending) {
+            return;
+        }
+        int32_t advanced = 0;
+        {
+            std::unique_lock<std::mutex> lk(pipe_mu);
+            pipe_cv.wait(lk, [this] { return pipe_res_ready; });
+            advanced = pipe_res_actual_steps;
+            pipe_res_drafts.clear();
+            pipe_res_actual_steps = 0;
+            pipe_res_ready = false;
+        }
+        pipe_has_pending = false;
+        if (advanced > 0) {
+            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_nextn), 0);
+            if (pos_max >= 0) {
+                const llama_pos drop_from = pos_max - advanced + 1;
+                llama_memory_seq_rm(llama_get_memory(ctx_nextn), 0, drop_from, -1);
+            }
         }
     }
 
@@ -1054,6 +1185,23 @@ struct common_speculative_state_nextn : public common_speculative_state {
         GGML_UNUSED(prompt_tgt);
         draft_tokens.clear();
 
+        // Async fast path: if prepare_next() submitted a draft on the previous
+        // iteration, return its result (lazy wait) — the worker has been
+        // computing the draft chain while the server processed sampling /
+        // tokenization / response building for the accepted tokens.
+        if (pipeline_enabled && pipe_has_pending) {
+            std::unique_lock<std::mutex> lk(pipe_mu);
+            pipe_cv.wait(lk, [this] { return pipe_res_ready; });
+            draft_tokens = std::move(pipe_res_drafts);
+            pipe_res_drafts.clear();
+            pipe_res_actual_steps = 0;
+            pipe_res_ready = false;
+            pipe_has_pending = false;
+            lk.unlock();
+            last_n_drafted = (uint16_t) draft_tokens.size();
+            return;
+        }
+
         if (last_n_drafted > 0) {
             const int32_t n_to_drop = (int32_t) last_n_drafted - 1;
             if (n_to_drop > 0) {
@@ -1102,6 +1250,7 @@ struct common_speculative_state_nextn : public common_speculative_state {
 
             const llama_token best = common_sampler_sample(smpl, ctx_nextn, 0);
             common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
+
             draft_tokens.push_back(best);
             cond_tok = best;
             ++pos;
@@ -1114,6 +1263,7 @@ struct common_speculative_state_nextn : public common_speculative_state {
         const llama_pos pos_max       = llama_memory_seq_pos_max(llama_get_memory(ctx_nextn), 0);
         const int32_t   n_drafted_last = (int32_t) last_n_drafted;
         const int32_t   n_to_drop      = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
+
         if (pos_max < 0) {
             last_n_accepted = (int32_t) n_accepted;
             return;
@@ -1125,6 +1275,79 @@ struct common_speculative_state_nextn : public common_speculative_state {
         }
         last_n_drafted  = 0;
         last_n_accepted = (int32_t) n_accepted;
+    }
+
+    void prepare_next(llama_token id_last) override {
+        if (!pipeline_enabled) {
+            return;
+        }
+        if (pipe_has_pending) {
+            // Should not happen: server contract is one submit per cycle.
+            LOG_WRN("%s: NextN prepare_next called while a draft is already pending; ignoring\n", __func__);
+            return;
+        }
+
+        // Zero-accept reconciliation. `common_speculative_accept` early-outs at
+        // n_accepted==0 and never calls state->accept(0), so `last_n_drafted`
+        // can remain >0 here with ctx_nextn KV still holding the *rejected*
+        // drafts from the previous cycle. The sync draft() path handles this
+        // with its own rollback block at entry; the async path must do the
+        // equivalent before reading pos_max — otherwise pos_start points into
+        // the rejected-draft range and the worker chain decodes from the wrong
+        // KV state, which empirically tanks acceptance from ~82% to ~66% over
+        // a long generation. Mirror the sync rollback here.
+        if (last_n_drafted > 0) {
+            const int32_t n_to_drop = (int32_t) last_n_drafted - 1;
+            if (n_to_drop > 0) {
+                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_nextn), 0);
+                if (pos_max >= 0) {
+                    const llama_pos drop_from = pos_max - n_to_drop + 1;
+                    llama_memory_seq_rm(llama_get_memory(ctx_nextn), 0, drop_from, -1);
+                }
+            }
+            last_n_drafted  = 0;
+            last_n_accepted = 0;
+        }
+
+        // Capture seed embedding row (target's pre-norm at last_n_accepted) and
+        // submit the request to the worker. The actual GPU draft compute happens
+        // on the worker thread while the server runs CPU-side post-accept work.
+        llama_synchronize(ctx_tgt);
+        const int32_t tgt_ith = last_n_accepted < 0
+                ? (h_idx >= 0 ? (int32_t) h_idx : -1)
+                : last_n_accepted;
+        float * src = llama_get_embeddings_pre_norm_ith(ctx_tgt, tgt_ith);
+        if (!src) {
+            return;
+        }
+        // Pipeline depth-2 with single-step submit is the empirically best
+        // knob on Apple Silicon Metal (matches Gemma MTP DRAFT_BLOCK_SIZE=2):
+        // overlap one draft decode with the next target verify, no deeper
+        // chain. Multi-step worker chains diverge from the sync chain's
+        // acceptance rate and tank end-to-end throughput; revisit once tree
+        // drafting / multi-seq KV are wired in.
+        const int32_t n_steps = 1;
+        const llama_pos pos_start = llama_memory_seq_pos_max(llama_get_memory(ctx_nextn), 0) + 1;
+
+        {
+            std::lock_guard<std::mutex> lk(pipe_mu);
+            pipe_req_embd.assign(src, src + n_embd);
+            pipe_req_id_last   = id_last;
+            pipe_req_n_steps   = n_steps;
+            pipe_req_pos_start = pos_start;
+            pipe_res_drafts.clear();
+            pipe_res_actual_steps = 0;
+            pipe_res_ready    = false;
+            pipe_req_pending  = true;
+            pipe_cv.notify_all();
+        }
+        pipe_has_pending = true;
+    }
+
+    void cancel() override {
+        if (pipeline_enabled) {
+            drain_pending_and_rollback();
+        }
     }
 };
 

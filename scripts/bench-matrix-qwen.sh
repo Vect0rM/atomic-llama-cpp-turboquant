@@ -20,6 +20,12 @@ SHORT_N="${SHORT_N:-128}"
 LONG_N="${LONG_N:-512}"
 RUNS="${RUNS:-3}"
 CTX="${CTX:-8192}"
+# Speculative knobs (only used for nextn modes). DRAFT_MAX=2 + DRAFT_MIN=1 matches
+# the async pipeline depth-2 sweet spot on Apple Silicon Metal (worker overlaps
+# one draft decode with one target verify, same as Gemma MTP DRAFT_BLOCK_SIZE=2).
+# Override via env to sweep, e.g. DRAFT_MAX=8 bash scripts/bench-matrix-qwen.sh.
+DRAFT_MAX="${DRAFT_MAX:-2}"
+DRAFT_MIN="${DRAFT_MIN:-1}"
 
 QWEN27_BASE="${QWEN27_BASE:-$ROOT/.scratch/Qwen3.6-27B-UD-Q4_K_XL/Qwen3.6-27B-UD-Q4_K_XL.gguf}"
 QWEN27_MTP="${QWEN27_MTP:-$ROOT/.scratch/Qwen3.6-27B-UD-Q4_K_XL_MTP/Qwen3.6-27B-UD-Q4_K_XL_MTP.gguf}"
@@ -184,7 +190,11 @@ run_cell() {
   fi
 
   echo "" >&2
-  echo "=== ${model_id} :: ${mode_id} (SPEC=${spec} CTK=${ctk} MAIN=$(basename "${main_g}")) ===" >&2
+  if [[ "$spec" == "nextn" ]]; then
+    echo "=== ${model_id} :: ${mode_id} (SPEC=${spec} CTK=${ctk} DM=${DRAFT_MAX} DN=${DRAFT_MIN} MAIN=$(basename "${main_g}")) ===" >&2
+  else
+    echo "=== ${model_id} :: ${mode_id} (SPEC=${spec} CTK=${ctk} MAIN=$(basename "${main_g}")) ===" >&2
+  fi
 
   stop_server
 
@@ -193,6 +203,7 @@ run_cell() {
     MAIN_GGUF="${main_g}" DRAFT_GGUF="${draft_g}" \
     VERIFY_NEXTN_GGUF="${verify}" \
     CTX="${CTX}" \
+    DRAFT_MAX="${DRAFT_MAX}" DRAFT_MIN="${DRAFT_MIN}" \
     NO_WARMUP=1 \
     HOST="${HOST}" PORT="${PORT}" \
     "${run_script}" > "${SRV_LOG}" 2>&1 &
