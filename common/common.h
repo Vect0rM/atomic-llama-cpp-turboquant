@@ -178,6 +178,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_MTP,           // Gemma 4 MTP assistant drafter
+    COMMON_SPECULATIVE_TYPE_NEXTN,         // Qwen3.x NextN second-context draft (same GGUF, arch override)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -867,6 +868,16 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
 std::string                   get_model_endpoint();
+
+// Whether the context can partially remove sequence cells (affects speculative rollback).
+enum common_context_seq_rm_type {
+    COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
+    COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+};
+
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
 //
 // Batch utils

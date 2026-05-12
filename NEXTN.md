@@ -1,0 +1,193 @@
+# Qwen 3.x NextN — shared-model speculative decoding
+
+> Scope: **Qwen3.6** (and compatible) models with NextN / MTP auxiliary head weights in GGUF.
+> The draft context now reuses the **target** `llama_model` (no second mmap of the combined
+> `_MTP.gguf`); a second `llama_context` is built over the same model with
+> `llama_context_params.nextn_draft = true`, which routes graph build to the NextN draft
+> builder (`qwen35_nextn` / `qwen35moe_nextn`).
+> Legacy standalone `*_mtp` GGUFs (`override_arch`) are still supported as a fallback for
+> users who ship the draft head as a separate artifact.
+> This path is **named `nextn`** in this fork to coexist with **Gemma 4 MTP** (`--spec-type mtp`), which uses a
+> single target context and `llama_decode_mtp_*`.
+
+See also `MTP.md` (Gemma) and `docs/speculative.md` for shared CLI concepts.
+
+---
+
+## 0. Pre-built model GGUFs
+
+Recommended source for Qwen 3.6 combined `*_MTP.gguf` checkpoints is the
+**unsloth** Hugging Face collection — the same files exercised in the
+matrix bench (§7):
+
+| Target | Combined `_MTP.gguf` (target + NextN head) | Recommended quant | Architecture |
+|---|---|---|---|
+| Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | **`UD-Q4_K_XL`** (22.9 GB) | `qwen35moe` |
+| Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | **`UD-Q4_K_XL`** | `qwen35` |
+
+Both repos ship `UD-IQ1_M` … `BF16` quants. The shared-model NextN path
+works on **any** of them as long as the file contains the NextN auxiliary
+head (`nextn_predict_layers > 0`) — which all `*-MTP-GGUF` quants do by
+construction. `scripts/verify-qwen36-nextn-gguf.py` will refuse to load a
+file missing the NextN layer.
+
+Quick pull via `-hf` (target) + `-hfd` (draft); the server resolves both to
+the same file in the HF cache and takes the shared-model branch:
+
+```bash
+# 35B-A3B MoE (headline +24-36 % cell in the matrix)
+llama-server \
+  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  --spec-type nextn --draft-max 2 --draft-min 1 \
+  -c 8192 -ngl 99 -ngld 99 -fa on
+
+# 27B dense
+llama-server \
+  -hf  unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  -hfd unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  --spec-type nextn --draft-max 2 --draft-min 1 \
+  -c 8192 -ngl 99 -ngld 99 -fa on
+```
+
+---
+
+## 1. Architecture
+
+| Piece | Role |
+|-------|------|
+| Target context | Standard `qwen35` / `qwen35moe` forward; graph publishes `t_h_pre_norm` (hidden before final norm). |
+| Draft context | Built over the **same** `llama_model` with `cparams.nextn_draft = true`. The graph dispatcher picks `llm_build_qwen35*_nextn` against the target's NextN-layer tensors (`model.layers[n_main + i].nextn.*`). KV cache is sized only for the NextN layer (`kv_only_nextn = true`, overridden transparently in `llama_context` ctor). |
+| Hidden transfer | Target and draft enable `embeddings_pre_norm`; `llama_decode` copies `t_h_pre_norm` rows into a CPU `embd_pre_norm` buffer. `common_speculative_state_nextn` reads via `llama_get_embeddings_pre_norm_ith` (no per-ubatch tensor hook). |
+| Speculative driver | `common_speculative_state_nextn` in `common/speculative.cpp` (greedy Top-1 chain). |
+| KV pairing | `llama_set_nextn(target, draft)` registers the draft context so `llama_context_nextn_seq_rm` can trim both KVs. |
+
+The shared-model path eliminates the ~22 GB second mmap (one `MTLBuffer` per `llama_model`)
+that used to OOM the 35B-A3B target on Apple Silicon (38 GB unified memory). See
+`llama_model_has_nextn_layer()` (target arch ∈ {qwen35, qwen35moe} **and**
+`hparams.nextn_predict_layers > 0`).
+
+---
+
+## 2. CLI / server
+
+- `--spec-type nextn` — enable NextN drafting (not Gemma `mtp`).
+- `--model-draft` / `-md` — pass the **same** path as `--model`; the server detects this
+  and switches to the shared-model path (no second model load). Pointing at a standalone
+  NEXTN_ONLY GGUF (`general.architecture = qwen35*_mtp`) still works but loads a second
+  `llama_model`.
+- `--draft-max` / `--spec-draft-n-max` — max chained draft tokens per round (see `common` / server arg naming).
+- Gemma MTP flags (`--mtp-head`, `llama_decode_mtp_*`, `llama_model_load_mtp_from_file`) are **unchanged**.
+
+---
+
+## 3. C API (subset)
+
+- `llama_set_nextn(target_ctx, draft_ctx)` — pair contexts for paired `seq_rm`.
+- `llama_context_nextn_seq_rm(target_ctx, …)` — remove KV on target **and** on the registered draft context (`seq_id` 0 on draft).
+
+Internal (see `src/llama-ext.h`, not in stable `include/llama.h`):
+
+- `llama_set_embeddings_pre_norm(ctx, bool)` — enable extraction/copy of pre-norm hidden rows into `embd_pre_norm`.
+- `llama_get_embeddings_pre_norm_ith(ctx, i)` — row `i` of the last decode’s pre-norm buffer (`i < 0` supported like other embedding getters).
+
+---
+
+## 4. Operations
+
+- **Vocab**: draft and target share tokenizer; arch check ensures `qwen35`+`qwen35_mtp` (or MoE pair).
+- **GDN rollback**: target may use `n_rs_seq` from speculative+GDN work; draft context forces `n_rs_seq = 0` (see `tools/server/server-context.cpp`).
+- **Metal / Vulkan**: GDN partial rollback quality may still be upstream-limited; see PR #22400 notes in the project plan.
+
+---
+
+## 5. Verify GGUF
+
+```bash
+PYTHONPATH=gguf-py python3 scripts/verify-qwen36-nextn-gguf.py /path/to/model.gguf
+```
+
+---
+
+## 6. Run scripts
+
+- `scripts/run-qwen36-27b-nextn-server.sh`
+- `scripts/run-qwen36-35ba3b-nextn-server.sh`
+
+Set `MAIN_GGUF` to your Qwen3.6 `*_MTP.gguf` (see §0 for the recommended
+unsloth quants); draft defaults to the same path so the server takes the
+shared-model branch. Alternatively use `-hf` (target) + `-hfd` (draft) to
+let `llama-server` pull both from Hugging Face into the local cache:
+
+```bash
+llama-server \
+  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  --spec-type nextn --draft-max 2 --draft-min 1
+```
+
+---
+
+## 7. Performance notes (MacBook Pro M4 Max, 40-core GPU, 48 GB, Metal)
+
+Median TPS over 3 runs, prompt = 50-token instruction, `--draft-max=2 --draft-min=1`,
+NextN draft DM=2 (single async chain), context 8192. Single-slot
+(`--parallel 1 -np 1 --cont-batching`), full GPU offload (`-ngl 99 -ngld 99 -fa on`),
+shared-model draft path (no second mmap of combined `_MTP.gguf`). See
+`.scratch/bench-logs/qwen-matrix-fullrun-20260512-222625.md`.
+
+### Bench host
+
+| Component | Value |
+|---|---|
+| Machine | MacBook Pro (`Mac16,5`, MX313LL/A) |
+| SoC | Apple **M4 Max** — 16 CPU cores (12P + 4E), **40-core GPU** |
+| Unified memory | **48 GB** LPDDR5 |
+| OS | macOS 26.3.1 (build 25D2128), Darwin 25.3.0 |
+| llama.cpp backend | Metal (full GPU offload: `-ngl 99 -ngld 99`, `-fa on`) |
+| Server | local `llama-server` over `127.0.0.1:8080` |
+| Client | `python3 urllib` → `/v1/chat/completions`, `temperature=0`, `cache_prompt=false`, `stream=false` |
+| Driver | `scripts/bench-matrix-qwen.sh` (3 runs/cell, median tps, mean accept) |
+
+Single-slot configuration (`--parallel 1 -np 1 --cont-batching`); no other
+heavy GPU/CPU workloads were running on the host during the matrix sweep.
+
+| model | mode | short tps (n=128) | long tps (n=512) | short accept | long accept | Δ short | Δ long |
+|---|---|---:|---:|---:|---:|---:|---:|
+| qwen-27B dense | f16-base       | 21.34 | 20.82 | — | — | — | — |
+| qwen-27B dense | f16-nextn      | **22.86** | **21.57** | 93.9% | 85.1% | **+7.1%** | **+3.6%** |
+| qwen-27B dense | turbo3-base    | 19.71 | 18.74 | — | — | — | — |
+| qwen-27B dense | turbo3-nextn   | **20.75** | **19.73** | 85.5% | 78.7% | **+5.3%** | **+5.3%** |
+| qwen-35B-A3B MoE | f16-base     | 70.09 | 69.63 | — | — | — | — |
+| qwen-35B-A3B MoE | f16-nextn    | **95.22** | **89.13** | 88.2% | 78.7% | **+35.8%** | **+28.0%** |
+| qwen-35B-A3B MoE | turbo3-base  | 61.84 | 62.01 | — | — | — | — |
+| qwen-35B-A3B MoE | turbo3-nextn | **82.73** | **77.20** | 82.9% | 80.6% | **+33.8%** | **+24.5%** |
+
+**Where NextN helps the most: MoE targets (qwen-35B-A3B).** Verify is heavy enough that the
+draft compute fully overlaps via the async pipeline; acceptance stays high (≥78%) at both
+prompt lengths. Wins range from **+24% (turbo3, long)** to **+36% (f16, short)**, on top of
+the +13% TurboQuant memory-bandwidth lift from `turbo3` KV.
+
+**Dense 27B is draft-compute-bound but no longer regresses.** The NextN-layer is a full
+transformer block; on a dense model `t_draft ≈ 2.6× t_verify`, so the async pipeline cannot
+overlap it fully and the upside is bounded by accept-rate × `(t_verify / (t_verify + non-overlapped t_draft))`.
+With the shared-model draft path (no double mmap, no graph rebuilds across submits) we land
+at **+5-7% across short/long, both KV typings** — modest but consistent, and *positive*
+where the previous double-mmap path was negative (the old `qwen-matrix-shared` matrix logged
+−7.6% / −11.9% on long for f16-nextn / turbo3-nextn respectively). `turbo3` KV adds ~5% extra
+draft compute on this rig (Metal dequant inside NextN attention) but it is hidden in the
+overlap and TurboQuant's bandwidth win covers the rest.
+
+### History within this branch (27B regression resolved)
+
+| Bench log (mtime) | Path | 27B f16-nextn long (Δ vs f16-base) | 27B turbo3-nextn long (Δ vs turbo3-base) | Note |
+|---|---|---:|---:|---|
+| `qwen-matrix-shared-20260512-202358.md` | double mmap | −7.6 % (18.93 vs 20.49) | −11.9 % (15.72 vs 17.85) | 35B-A3B OOM on long prompts |
+| `qwen-matrix-fullrun-20260512-222625.md` | shared model | **+3.6 % (21.57 vs 20.82)** | **+5.3 % (19.73 vs 18.74)** | this matrix |
+
+The jump came from a single architectural change: dropping the second
+`llama_model_load_from_file` and reusing the target's already-loaded NextN tensors via
+`cparams.nextn_draft = true`. Side-effects: (a) 22 GB second `MTLBuffer` gone — 35B-A3B MoE
+now runs without OOM and posts +24-36%; (b) draft KV cache resized only for the NextN layer
+(`kv_only_nextn = true` is mutated transparently in `llama_context` ctor for draft); (c) the
+NextN graph builder now flows through `LLM_GRAPH_TYPE_NEXTN` instead of `override_arch`.

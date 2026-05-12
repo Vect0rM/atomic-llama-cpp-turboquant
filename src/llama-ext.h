@@ -54,3 +54,8 @@ LLAMA_API void llama_quant_compute_types(
         ggml_tensor ** tensors,
         ggml_type * result_types,
         size_t n_tensors);
+
+// Pre-final-norm hidden states (Qwen NextN draft input; not in stable public llama.h).
+LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool embeddings_pre_norm);
+LLAMA_API float * llama_get_embeddings_pre_norm(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);

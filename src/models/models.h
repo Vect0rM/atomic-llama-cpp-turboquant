@@ -55,6 +55,17 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // fused op with keep_intermediates=true: returns the raw [attn | T snapshots]
+    // output tensor. Caller slices snapshot views and routes them to recurrent slots.
+    ggml_tensor * build_delta_net_fused_keep_intermediates(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                        int   il);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
@@ -654,6 +665,15 @@ private:
                         int   il);
 
     const llama_model & model;
+};
+
+// Qwen3.6 NextN draft head (standalone context, KV on tail layers only; GGUF arch: qwen35_mtp / qwen35moe_mtp)
+struct llm_build_qwen35_nextn : public llm_graph_context {
+    llm_build_qwen35_nextn(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_qwen35moe_nextn : public llm_graph_context {
+    llm_build_qwen35moe_nextn(const llama_model & model, const llm_graph_params & params);
 };
 
 struct llm_build_qwen : public llm_graph_context {

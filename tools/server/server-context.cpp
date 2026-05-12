@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
+#include <vector>
 #include <exception>
 #include <memory>
 #include <sstream>
@@ -56,6 +58,9 @@ struct server_slot {
 
     // multimodal
     mtmd_context * mctx = nullptr;
+
+    // seq_rm capability for speculative checkpoints / GDN rollback (see common_context_can_seq_rm)
+    common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative * spec = nullptr;
 
@@ -135,7 +140,7 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        llama_context_nextn_seq_rm(ctx, id, -1, -1);
         prompt.tokens.clear();
     }
 
@@ -439,7 +444,7 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        llama_memory_seq_rm(llama_get_memory(ctx), other.id,     -1, -1);
+        llama_context_nextn_seq_rm(ctx, other.id, -1, -1);
         llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
 
         other.n_decoded   = n_decoded;
@@ -666,6 +671,86 @@ private:
                 // MTP assistant is loaded into the target in common_init_from_params (llama_model_load_mtp_from_file).
                 SRV_INF("MTP assistant path '%s' (loaded into target model)\n", params_spec.mparams_dft.path.c_str());
                 params_base.speculative.model_dft = nullptr;
+            } else if (params_spec.type == COMMON_SPECULATIVE_TYPE_NEXTN) {
+                // NextN draft path. Two backends:
+                //
+                //   (a) Shared-model path (default, no second mmap): target was loaded from a
+                //       combined *_MTP GGUF (hparams.nextn_predict_layers > 0). The NextN-layer
+                //       tensors physically live in the target model's tensor table already, so
+                //       we DON'T allocate a second llama_model — we just spin up a second
+                //       llama_context on top of the same llama_model with cparams.nextn_draft=true,
+                //       which routes build_graph() to the qwen35*_nextn builder. KV cache is sized
+                //       only for the target model's non-recurrent layers (small) and is per-context,
+                //       so the two contexts never share KV state. This eliminates the previous
+                //       ~22 GB second mmap (kIOGPUCommandBufferCallbackErrorOutOfMemory on M-series).
+                //
+                //   (b) Standalone NEXTN_ONLY GGUF (legacy): user passes a small extracted GGUF
+                //       (general.architecture = 'qwen35_mtp' / 'qwen35moe_mtp') as --model-draft.
+                //       In that case we fall back to the old second-model load — but without any
+                //       override_arch (the file's own arch is already correct). Only useful when
+                //       the user wants to ship the draft head as a separate artifact.
+                const bool target_has_nextn = llama_model_has_nextn_layer(model);
+                const bool draft_is_same_file =
+                        params_spec.mparams_dft.path == params_base.model.path;
+
+                if (target_has_nextn && draft_is_same_file) {
+                    SRV_INF("NextN draft: shared-model path (target %s, no second mmap; nextn_predict_layers=%u)\n",
+                            llama_model_arch_str(model),
+                            (unsigned) llama_model_n_nextn_predict_layers(model));
+
+                    auto params_dft = params_base;
+                    params_dft.n_parallel   = 1;
+                    params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                    params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                    params_dft.cache_type_k = params_spec.cache_type_k;
+                    params_dft.cache_type_v = params_spec.cache_type_v;
+                    if (params_spec.cpuparams.n_threads > 0) {
+                        params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                        params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    }
+
+                    auto cparams_dft = common_context_params_to_llama(params_dft);
+                    cparams_dft.nextn_draft = true;
+                    cparams_dft.n_rs_seq    = 0;
+
+                    params_base.speculative.model_dft   = model;
+                    params_base.speculative.cparams_dft = cparams_dft;
+                } else {
+                    if (target_has_nextn) {
+                        SRV_INF("NextN draft: standalone GGUF '%s' (target has NextN but user pointed --model-draft at a separate file)\n",
+                                params_spec.mparams_dft.path.c_str());
+                    } else {
+                        SRV_INF("NextN draft: standalone GGUF '%s' (target arch=%s has no NextN tensors; loading second model)\n",
+                                params_spec.mparams_dft.path.c_str(),
+                                llama_model_arch_str(model));
+                    }
+
+                    auto params_dft = params_base;
+                    params_dft.n_parallel   = 1;
+                    params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                    params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                    params_dft.devices      = params_spec.devices;
+                    params_dft.model        = params_spec.mparams_dft;
+                    params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+                    params_dft.cache_type_k = params_spec.cache_type_k;
+                    params_dft.cache_type_v = params_spec.cache_type_v;
+                    if (params_spec.cpuparams.n_threads > 0) {
+                        params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                        params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    }
+                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+                    auto mparams_dft = common_model_params_to_llama(params_dft);
+                    model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+                    if (model_dft == nullptr) {
+                        SRV_ERR("failed to load NextN draft model, '%s'\n", params_dft.model.path.c_str());
+                        return false;
+                    }
+
+                    params_base.speculative.model_dft   = model_dft.get();
+                    params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                    params_base.speculative.cparams_dft.n_rs_seq = 0;
+                }
             } else {
                 SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
 
@@ -697,6 +782,8 @@ private:
 
                 params_base.speculative.model_dft = model_dft.get();
                 params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                // draft context does not need recurrent rollback snapshots (target owns n_rs_seq)
+                params_base.speculative.cparams_dft.n_rs_seq = 0;
             }
         }
 
@@ -779,6 +866,11 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
+        const common_context_seq_rm_type ctx_seq_rm_global = common_context_can_seq_rm(ctx);
+        if (ctx_seq_rm_global == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            SRV_WRN("%s", "speculative decoding may use checkpoints (full sequence removal only)\n");
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot slot;
@@ -786,6 +878,8 @@ private:
             slot.id    = i;
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
+
+            slot.ctx_seq_rm_type = ctx_seq_rm_global;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2061,7 +2155,7 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                llama_context_nextn_seq_rm(ctx, slot.id, n_keep, n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 // add generated tokens to cache
@@ -2331,7 +2425,7 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
+                                            llama_context_nextn_seq_rm(ctx, slot.id, head_p, head_c);
                                             llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -2498,7 +2592,7 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                    if (!llama_context_nextn_seq_rm(ctx, slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         slot.prompt_clear(true);
@@ -2530,13 +2624,30 @@ private:
                     // checkpoints are created only if:
                     // - the model uses SWA and we are not using `swa_full`
                     // - the model architecture is marked as recurrent or hybrid
+                    // - sequence removal is full-only or bounded partial (GDN / speculative rollback)
                     //
                     // TODO: try to make this conditional on the context or the memory module, instead of the model type
-                    do_checkpoint = do_checkpoint && (
-                            llama_model_is_recurrent(model) ||
-                            llama_model_is_hybrid(model) ||
-                            (llama_model_n_swa(model) > 0 && !params_base.swa_full)
-                            );
+                    {
+                        const bool n_swa_active = llama_model_n_swa(model) > 0 && !params_base.swa_full;
+                        do_checkpoint = do_checkpoint && (
+                                slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL
+                                || slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED
+                                || n_swa_active
+                                || llama_model_is_recurrent(model)
+                                || llama_model_is_hybrid(model));
+                    }
+
+                    // Qwen NextN draft prime needs pre-norm rows for the WHOLE prompt to
+                    // be present in the target's embd_pre_norm buffer when begin() runs.
+                    // The checkpoint-split logic decodes the last few prompt tokens in a
+                    // separate batch, which would overwrite output_ids of the earlier
+                    // tokens and lose their pre-norm rows. Disable the split for NextN
+                    // slots — the speculative rollback already keeps draft KV consistent
+                    // via llama_context_nextn_seq_rm. Gemma 4 MTP path is unaffected.
+                    if (slot.spec != nullptr &&
+                            slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_NEXTN) {
+                        do_checkpoint = false;
+                    }
 
                     bool has_mtmd = false;
 
@@ -2563,6 +2674,14 @@ private:
                         has_mtmd = true;
                     }
 
+                    // Qwen NextN draft prime requires per-token pre-norm hidden states from
+                    // the target, so we must flag every prompt token as an output during
+                    // prefill (logits[i] = true). Gemma 4 MTP keeps its prior semantics
+                    // (last-token output only) and is not affected.
+                    const bool nextn_prefill_all_outputs =
+                            slot.spec != nullptr &&
+                            slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_NEXTN;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
@@ -2579,12 +2698,15 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output
+                        // embedding requires all tokens in the batch to be output;
+                        // NextN draft prime also needs per-token outputs (pre-norm h_i).
+                        const bool need_logits =
+                                slot.task->need_embd() || nextn_prefill_all_outputs;
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            need_logits);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2724,15 +2846,23 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            // MTP speculative decoding requires the *target* context to keep producing
-            // hidden states between rounds (the assistant draft consumes the last
-            // target hidden row as part of its input embedding). Without this, the
-            // server would reset embeddings to false for chat/completion tasks and the
-            // draft would always run on a zero h_prev, ruining acceptance rate.
-            const bool mtp_active =
+            // Gemma 4 MTP speculative decoding requires the *target* context to keep
+            // producing hidden states between rounds (the assistant draft consumes the
+            // last target hidden row as part of its input embedding). Without this,
+            // the server would reset embeddings to false for chat/completion tasks and
+            // the draft would always run on a zero h_prev, ruining acceptance rate.
+            //
+            // Qwen NextN does NOT need cparams.embeddings = true on the target:
+            // it consumes per-token PRE-norm hidden states via a separate channel
+            // (llama_set_embeddings_pre_norm + llama_get_embeddings_pre_norm_ith).
+            // Flipping cparams.embeddings on for NextN reroutes the target graph to
+            // emit pooled/embedding outputs in place of vocab logits, which then
+            // corrupts sampling for the very first generated token (and every chain
+            // thereafter).
+            const bool gemma_mtp_active =
                 slot_batched->spec != nullptr &&
                 slot_batched->task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
-            const bool need_embeddings = slot_batched->task->need_embd() || mtp_active;
+            const bool need_embeddings = slot_batched->task->need_embd() || gemma_mtp_active;
             llama_set_embeddings(ctx, need_embeddings);
         }
 
@@ -2972,7 +3102,7 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                llama_context_nextn_seq_rm(ctx, slot.id, slot.prompt.n_tokens(), -1);
 
                 common_speculative_prepare_next(slot.spec, slot.sampled);
 

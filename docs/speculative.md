@@ -140,6 +140,28 @@ python convert_hf_to_gguf.py .scratch/gemma-4-26B-A4B-it-assistant \
 
 Use the resulting GGUF as `--mtp-head` (or `-md`) with `--spec-type mtp`. Older assistant GGUFs with `token_embd.weight` first axis 2816 (backbone width) instead of 1024 will fail load; run `scripts/verify-gemma4-assistant-gguf.py` on the file to check.
 
+### Qwen 3.x NextN (`nextn`)
+
+For **Qwen3.6** (and compatible) checkpoints that ship NextN head weights in the combined `*_MTP.gguf`, use `--spec-type nextn` with **`--model-draft` (`-md`)** pointing at the **same** GGUF as the main model. The server detects this and **reuses the already-loaded target `llama_model`** — a second `llama_context` is built over the same weights with `llama_context_params.nextn_draft = true`, which routes graph construction to `llm_build_qwen35_nextn` / `llm_build_qwen35moe_nextn` and sizes the draft KV cache only for the NextN layer (`kv_only_nextn = true`, mutated transparently inside `llama_context` ctor). There is **no second mmap of the GGUF**.
+
+- Drafting reads **CPU-copied** pre-final-norm hidden states (`embeddings_pre_norm` path); it does **not** use Gemma's `llama_decode_mtp_*` APIs.
+- **`llama_set_nextn`** only pairs target and draft for **`llama_context_nextn_seq_rm`**; see `NEXTN.md` for details.
+- Standalone NEXTN_ONLY GGUFs (`general.architecture = qwen35*_mtp`) are still supported as a fallback for users who ship the draft head as a separate artifact (the server then performs a second `llama_model_load_from_file` with `override_arch`); the shared-model path is preferred whenever `--model` and `--model-draft` point at the same combined `_MTP.gguf`.
+
+```sh
+llama-server \
+  -m /path/to/qwen3.6-MTP.gguf \
+  -md /path/to/qwen3.6-MTP.gguf \
+  --spec-type nextn \
+  --draft-max 2 --draft-min 1 \
+  -c 8192 -ngl 99 -ngld 99 -fa on \
+  --host 127.0.0.1 --port 8080
+```
+
+Pair with `-ctk turbo3 -ctv turbo3` to compose with **TurboQuant** KV — on MoE targets (e.g. Qwen 3.6 35B-A3B) this combination is **+24-36% tps** over the `turbo3` baseline at single-slot in the matrix bench (see `NEXTN.md §7`).
+
+Repo helpers: `scripts/run-qwen36-27b-nextn-server.sh`, `scripts/run-qwen36-35ba3b-nextn-server.sh`.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

@@ -312,6 +312,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // if non-NULL, replace architecture from GGUF after read (e.g. load same file as qwen35_mtp for NextN draft)
+        const char * override_arch;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -335,6 +338,7 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+        uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -376,6 +380,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool nextn_draft; // this context is the Qwen NextN draft side: build the NextN draft graph against the *target* llama_model
+                          // (no second mmap of the combined MTP GGUF). Default false. Set true only for the draft context.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -506,6 +512,14 @@ extern "C" {
     // Backbone hidden size for MTP input (0 if no MTP assistant is loaded).
     LLAMA_API uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model);
 
+    // Qwen NextN: true when the target model was loaded from a combined *_MTP GGUF
+    // (i.e. hparams.nextn_predict_layers > 0) and its arch is one of {qwen35, qwen35moe}.
+    // Drives the shared-model NextN draft path (no second 22 GB mmap).
+    LLAMA_API bool llama_model_has_nextn_layer(const struct llama_model * model);
+
+    // Number of NextN predict layers stored in the target model (0 if none / not supported).
+    LLAMA_API uint32_t llama_model_n_nextn_predict_layers(const struct llama_model * model);
+
     LLAMA_API void llama_model_save_to_file(
             const struct llama_model * model,
                         const char * path_model);
@@ -567,6 +581,7 @@ extern "C" {
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_rs_seq       (const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -1028,6 +1043,19 @@ extern "C" {
             struct llama_context * ctx,
             llama_token * out_drafts,
             float       * out_h_prev_last);
+
+    // Qwen NextN (second-context draft): pair target `ctx` with a draft head context built from the same GGUF.
+    // Gemma 4 MTP APIs above are unchanged.
+    LLAMA_API void llama_set_nextn(
+            struct llama_context * ctx_target,
+            struct llama_context * ctx_nextn);
+
+    // Remove KV on both target and NextN draft contexts (draft uses seq_id 0).
+    LLAMA_API bool llama_context_nextn_seq_rm(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              p0,
+            llama_pos              p1);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

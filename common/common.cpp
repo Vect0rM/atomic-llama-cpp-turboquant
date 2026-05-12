@@ -1439,6 +1439,47 @@ std::string get_model_endpoint() {
     return model_endpoint;
 }
 
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    auto * mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
+    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
+    llama_memory_clear(mem, true);
+
+    // eval 2 tokens to check if the context is compatible
+    std::vector<llama_token> tmp;
+    tmp.push_back(0);
+    tmp.push_back(0);
+
+    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        goto done;
+    }
+
+    if (llama_n_rs_seq(ctx) > 0) {
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED;
+        goto done;
+    }
+
+    // try to remove the last tokens
+    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        goto done;
+    }
+
+done:
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx);
+
+    return res;
+}
+
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;
@@ -1495,6 +1536,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    {
+        // TODO: add for MTP
+        const bool has_spec = (params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE)
+                              || params.speculative.has_dft();
+        cparams.n_rs_seq = has_spec ? (uint32_t) params.speculative.n_max : 0u;
+    }
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

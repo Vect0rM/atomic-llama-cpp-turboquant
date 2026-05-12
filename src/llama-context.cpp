@@ -44,6 +44,13 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    cparams.n_rs_seq = params.n_rs_seq;
+    if (cparams.n_rs_seq > 0 && !llm_arch_supports_recurrent_partial_rollback(model.arch)) {
+        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
+                        __func__, cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
+
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
     cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -51,6 +58,8 @@ llama_context::llama_context(
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
+    cparams.embeddings_pre_norm = false;
+    cparams.nextn_draft      = params.nextn_draft;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -282,7 +291,30 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
+        // NextN draft context shares the target llama_model: temporarily flip the
+        // model's hparams so the freshly-constructed KV cache only allocates cells
+        // for the NextN layer(s). The memory implementations copy hparams in their
+        // ctor (see llama_kv_cache / llama_memory_hybrid), so the override only
+        // affects this draft memory — target's memory was constructed earlier with
+        // the original layout and keeps its own copy. We restore immediately after.
+        bool saved_kv_only_nextn = false;
+        int32_t saved_n_layer_kv_from_start = -1;
+        const bool do_nextn_override = cparams.nextn_draft && hparams.nextn_predict_layers > 0;
+        if (do_nextn_override) {
+            llama_hparams & h_mut = const_cast<llama_hparams &>(model.hparams);
+            saved_kv_only_nextn          = h_mut.kv_only_nextn;
+            saved_n_layer_kv_from_start  = h_mut.n_layer_kv_from_start;
+            h_mut.kv_only_nextn         = true;
+            h_mut.n_layer_kv_from_start = -1;
+        }
+
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (do_nextn_override) {
+            llama_hparams & h_mut = const_cast<llama_hparams &>(model.hparams);
+            h_mut.kv_only_nextn         = saved_kv_only_nextn;
+            h_mut.n_layer_kv_from_start = saved_n_layer_kv_from_start;
+        }
     }
 
     // init backends
@@ -872,6 +904,33 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+float * llama_context::get_embeddings_pre_norm() {
+    output_reorder();
+
+    return embd_pre_norm.data;
+}
+
+float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (embd_pre_norm.data == nullptr) {
+            throw std::runtime_error("no pre-norm embeddings");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        const uint32_t n_embd_h = model.hparams.n_embd;
+        return embd_pre_norm.data + j * n_embd_h;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid pre-norm embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1050,6 +1109,12 @@ void llama_context::set_embeddings(bool value) {
 
     // TODO: not sure yet if we want to reserve here
     //sched_need_reserve = true;
+}
+
+void llama_context::set_embeddings_pre_norm(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.embeddings_pre_norm = value;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1454,7 +1519,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
-    GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+    GGML_ASSERT(batch_inp.token || batch_inp.embd); // NOLINT
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1527,6 +1592,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     auto * t_logits = res->get_logits();
     auto * t_embd = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
+    auto * t_h_pre_norm = cparams.embeddings_pre_norm ? res->get_h_pre_norm() : nullptr;
 
     // extract logits
     if (logits.data && t_logits) {
@@ -1590,6 +1656,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ABORT("unknown pooling type");
                 }
         }
+    }
+
+    if (embd_pre_norm.data && t_h_pre_norm && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
+        GGML_ASSERT(backend_h != nullptr);
+        const uint32_t n_embd_h = hparams.n_embd;
+        GGML_ASSERT((int64_t) n_tokens * (int64_t) n_embd_h <= (int64_t) embd_pre_norm.size);
+        ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens * n_embd_h * sizeof(float));
     }
 
     // TODO: hacky solution
@@ -1744,7 +1818,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+    GGML_ASSERT(batch_inp.token || batch_inp.embd); // NOLINT
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1903,7 +1977,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        const llm_graph_type decode_gtype = cparams.nextn_draft ? LLM_GRAPH_TYPE_NEXTN : LLM_GRAPH_TYPE_DECODER;
+        const auto * res = process_ubatch(ubatch, decode_gtype, mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1943,6 +2018,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+        auto * t_h_pre_norm = cparams.embeddings_pre_norm ? res->get_h_pre_norm() : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2020,6 +2096,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         GGML_ABORT("unknown pooling type");
                     }
+            }
+        }
+
+        // extract pre-norm hidden states (before final output norm), per-token
+        if (embd_pre_norm.data && t_h_pre_norm && n_outputs > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
+            GGML_ASSERT(backend_h != nullptr);
+            const uint32_t n_embd_h = hparams.n_embd;
+            float * embd_h_out = embd_pre_norm.data + n_outputs_prev * n_embd_h;
+            if (n_outputs) {
+                GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((n_outputs_prev + n_outputs) * n_embd_h <= (int64_t) embd_pre_norm.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_h_out, 0, n_outputs * n_embd_h * sizeof(float));
             }
         }
 
@@ -2111,6 +2200,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     bool has_logits = true;
     bool has_embd   = cparams.embeddings;
+    bool has_embd_pre_norm = cparams.embeddings_pre_norm;
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {
@@ -2124,6 +2214,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
+    embd_pre_norm.size = has_embd_pre_norm ? (size_t) hparams.n_embd * n_outputs_max : 0;
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -2139,7 +2230,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + embd_pre_norm.size + backend_float_count) * sizeof(float) +
         (                          backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2156,6 +2247,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             buf_output = nullptr;
             logits.data = nullptr;
             embd.data = nullptr;
+            embd_pre_norm.data = nullptr;
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2183,6 +2275,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
+
+    embd_pre_norm = has_embd_pre_norm ? buffer_view<float>{(float *) (base + offset), embd_pre_norm.size} : buffer_view<float>{nullptr, 0};
+    offset += embd_pre_norm.size * sizeof(float);
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2245,6 +2340,12 @@ void llama_context::output_reorder() {
         if (embd.size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+            }
+        }
+
+        if (embd_pre_norm.size > 0) {
+            for (uint64_t k = 0; k < n_embd; k++) {
+                std::swap(embd_pre_norm.data[i0*n_embd + k], embd_pre_norm.data[i1*n_embd + k]);
             }
         }
 
@@ -2335,7 +2436,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const llm_graph_type reserve_gtype = cparams.nextn_draft ? LLM_GRAPH_TYPE_NEXTN : LLM_GRAPH_TYPE_DEFAULT;
+    const auto gparams = graph_params(res, ubatch, mctx, reserve_gtype);
 
     res->reset();
 
@@ -2364,9 +2466,20 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // For NextN draft contexts that share the target llama_model we hand a
+    // tweaked copy of hparams to the graph builder (kv_only_nextn=true so
+    // build_attn_inp_kv() routes attention to the single NextN layer's KV cells
+    // that create_memory() allocated for this context). The target context is
+    // unaffected because it keeps its own llm_graph_params built from the same
+    // (unmodified) model.hparams reference.
+    llama_hparams hparams_eff = model.hparams;
+    if (cparams.nextn_draft && hparams_eff.nextn_predict_layers > 0) {
+        hparams_eff.kv_only_nextn         = true;
+        hparams_eff.n_layer_kv_from_start = -1;
+    }
     return {
         /*.arch         =*/ model.arch,
-        /*.hparams      =*/ model.hparams,
+        /*.hparams      =*/ hparams_eff,
         /*.cparams      =*/ cparams,
         /*.ubatch       =*/ ubatch,
         /*.gtype        =*/ gtype,
@@ -3468,6 +3581,7 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_rs_seq                    =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -3494,6 +3608,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.nextn_draft                 =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -3639,6 +3754,10 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
 }
 
+uint32_t llama_n_rs_seq(const llama_context * ctx) {
+    return ctx->get_cparams().n_rs_seq;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -3678,12 +3797,48 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_set_embeddings_pre_norm(llama_context * ctx, bool embeddings_pre_norm) {
+    ctx->set_embeddings_pre_norm(embeddings_pre_norm);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_context::set_nextn(llama_context * ctx_nextn_in) {
+    nextn.ctx_nextn = ctx_nextn_in;
+    if (nextn.ctx_nextn) {
+        LLAMA_LOG_INFO("%s: NextN draft context registered (ctx_nextn=%p)\n",
+                __func__, (const void *) nextn.ctx_nextn);
+    } else {
+        LLAMA_LOG_INFO("%s: NextN draft context unregistered\n", __func__);
+    }
+}
+
+void llama_set_nextn(struct llama_context * ctx_target, struct llama_context * ctx_nextn) {
+    if (!ctx_target) {
+        return;
+    }
+    ctx_target->set_nextn(ctx_nextn);
+}
+
+bool llama_context_nextn_seq_rm(
+        struct llama_context * ctx,
+        llama_seq_id           seq_id,
+        llama_pos              p0,
+        llama_pos              p1) {
+    if (!ctx) {
+        return true;
+    }
+    const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
+    if (llama_context * ctx_nextn = ctx->get_nextn()) {
+        llama_memory_seq_rm(llama_get_memory(ctx_nextn), 0, p0, p1);
+    }
+    return ok;
 }
 
 void llama_synchronize(llama_context * ctx) {
@@ -3726,6 +3881,18 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+float * llama_get_embeddings_pre_norm(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_pre_norm();
+}
+
+float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_pre_norm_ith(i);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

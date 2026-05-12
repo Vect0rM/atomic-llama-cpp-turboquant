@@ -45,6 +45,8 @@ enum llm_arch {
     LLM_ARCH_QWEN3VLMOE,
     LLM_ARCH_QWEN35,
     LLM_ARCH_QWEN35MOE,
+    LLM_ARCH_QWEN35_NEXTN,
+    LLM_ARCH_QWEN35MOE_NEXTN,
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
     LLM_ARCH_PHIMOE,
@@ -649,3 +651,4 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+bool llm_arch_supports_recurrent_partial_rollback(const llm_arch & arch);

@@ -32,6 +32,10 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_MTP,
+    // Qwen NextN draft graph: dispatches the qwen35*_nextn builder against the
+    // *same* llama_model as the target context, avoiding a second 22 GB mmap of
+    // the combined MTP GGUF (target ships NextN tensors in its last layer).
+    LLM_GRAPH_TYPE_NEXTN,
 };
 
 enum llm_ffn_op_type {
@@ -662,6 +666,7 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
     // Optional in-graph argmax tensor (I32 [n_outputs]). Currently set only by the
     // Gemma4 MTP graph so the host can read a 4-byte argmax instead of an
     // n_vocab-float logits row + CPU argmax loop.
@@ -695,6 +700,10 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_argmax      = nullptr; // optional, currently MTP-only (see get_argmax)
+    // Qwen3.x NextN head hook: hidden state before final norm on the target trunk (feeds draft ctx).
+    ggml_tensor * t_h_pre_norm  = nullptr;
+    // Post-FFN hidden inside the NextN draft graph (chained MTP when n_steps > 1).
+    ggml_tensor * t_nextn_out   = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

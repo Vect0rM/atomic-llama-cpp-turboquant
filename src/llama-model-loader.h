@@ -80,6 +80,11 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
 
+    // when true, done_getting_tensors() tolerates GGUF files that contain
+    // more tensors than the loader actually requested (e.g. loading a
+    // single combined GGUF as a NextN/MTP draft via params.override_arch).
+    bool partial_load = false;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;

@@ -614,7 +614,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // NextN draft graphs (Qwen 3.6) consume only the attention slot of the hybrid
+    // input. Their graphs never reference inp_rs->s_copy, so the scheduler never
+    // allocates a backend buffer for it. Skip the recurrent-state copy in that
+    // case instead of asserting on the missing buffer.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -834,6 +838,8 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_argmax      = nullptr;
+    t_h_pre_norm  = nullptr;
+    t_nextn_out   = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2662,7 +2668,8 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
+    GGML_UNUSED(rs_size);
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
