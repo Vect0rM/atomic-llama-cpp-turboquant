@@ -40,7 +40,12 @@ llm_build_qwen35moe_nextn::llm_build_qwen35moe_nextn(
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos = build_inp_pos();
-    auto * inp_attn       = build_attn_inp_kv();
+    // qwen35moe target arch uses hybrid memory (attn + GDN recurrent). When the draft
+    // context shares the target llama_model, mctx is llama_memory_hybrid_context,
+    // not llama_kv_cache_context — so we must route through the hybrid input and
+    // pick its attn slot. (Casting hybrid -> pure KV directly would be UB and SIGSEGV.)
+    auto * inp_hybrid     = build_inp_mem_hybrid();
+    auto * inp_attn       = inp_hybrid->get_attn();
 
     ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "nextn_hnorm", il);

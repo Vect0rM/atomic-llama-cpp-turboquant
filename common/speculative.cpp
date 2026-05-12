@@ -915,22 +915,33 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 };
 
-// Qwen NextN: second-context draft from the same GGUF (loaded with override_arch -> qwen35_mtp / qwen35moe_mtp).
+// Qwen NextN compatibility check. Two valid configurations:
+//   (a) Shared-model path: target arch in {qwen35, qwen35moe} AND draft model pointer
+//       == target model pointer (single llama_model, single mmap). This is the default
+//       since the combined *_MTP GGUF ships NextN tensors inside the target model's
+//       layer table; the draft context just runs a different graph against them.
+//   (b) Standalone NEXTN_ONLY GGUF: target arch in {qwen35, qwen35moe}, draft arch is
+//       the matching '*_mtp' override (qwen35_mtp / qwen35moe_mtp). Vocab must match.
 static bool common_speculative_are_compatible_nextn(
         const llama_model * model_tgt,
         const llama_model * model_dft) {
     const char * at = llama_model_arch_str(model_tgt);
+    if (std::strcmp(at, "qwen35") != 0 && std::strcmp(at, "qwen35moe") != 0) {
+        return false;
+    }
+    if (model_dft == model_tgt) {
+        // Shared-model path: NextN-layer tensors must exist in target.
+        return llama_model_has_nextn_layer(model_tgt);
+    }
     const char * ad = llama_model_arch_str(model_dft);
     if (std::strcmp(at, "qwen35") == 0) {
         if (std::strcmp(ad, "qwen35_mtp") != 0) {
             return false;
         }
-    } else if (std::strcmp(at, "qwen35moe") == 0) {
+    } else { // qwen35moe
         if (std::strcmp(ad, "qwen35moe_mtp") != 0) {
             return false;
         }
-    } else {
-        return false;
     }
     return common_speculative_are_compatible_mtp(model_tgt, model_dft);
 }

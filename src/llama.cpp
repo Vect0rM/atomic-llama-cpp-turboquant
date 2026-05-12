@@ -1254,6 +1254,25 @@ uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model) {
     return m->mtp_assistant->hparams.n_embd_backbone;
 }
 
+bool llama_model_has_nextn_layer(const struct llama_model * model) {
+    if (!model) {
+        return false;
+    }
+    const llama_model * m = (const llama_model *) model;
+    if (m->hparams.nextn_predict_layers == 0) {
+        return false;
+    }
+    return m->arch == LLM_ARCH_QWEN35 || m->arch == LLM_ARCH_QWEN35MOE;
+}
+
+uint32_t llama_model_n_nextn_predict_layers(const struct llama_model * model) {
+    if (!model) {
+        return 0;
+    }
+    const llama_model * m = (const llama_model *) model;
+    return m->hparams.nextn_predict_layers;
+}
+
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
     llama_model_saver ms(model);
     ms.add_kv_from_model();

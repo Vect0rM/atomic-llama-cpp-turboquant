@@ -32,6 +32,10 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_MTP,
+    // Qwen NextN draft graph: dispatches the qwen35*_nextn builder against the
+    // *same* llama_model as the target context, avoiding a second 22 GB mmap of
+    // the combined MTP GGUF (target ships NextN tensors in its last layer).
+    LLM_GRAPH_TYPE_NEXTN,
 };
 
 enum llm_ffn_op_type {

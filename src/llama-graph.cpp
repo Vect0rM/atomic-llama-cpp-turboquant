@@ -614,7 +614,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // NextN draft graphs (Qwen 3.6) consume only the attention slot of the hybrid
+    // input. Their graphs never reference inp_rs->s_copy, so the scheduler never
+    // allocates a backend buffer for it. Skip the recurrent-state copy in that
+    // case instead of asserting on the missing buffer.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 

@@ -59,6 +59,7 @@ llama_context::llama_context(
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
     cparams.embeddings_pre_norm = false;
+    cparams.nextn_draft      = params.nextn_draft;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -290,7 +291,30 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
+        // NextN draft context shares the target llama_model: temporarily flip the
+        // model's hparams so the freshly-constructed KV cache only allocates cells
+        // for the NextN layer(s). The memory implementations copy hparams in their
+        // ctor (see llama_kv_cache / llama_memory_hybrid), so the override only
+        // affects this draft memory — target's memory was constructed earlier with
+        // the original layout and keeps its own copy. We restore immediately after.
+        bool saved_kv_only_nextn = false;
+        int32_t saved_n_layer_kv_from_start = -1;
+        const bool do_nextn_override = cparams.nextn_draft && hparams.nextn_predict_layers > 0;
+        if (do_nextn_override) {
+            llama_hparams & h_mut = const_cast<llama_hparams &>(model.hparams);
+            saved_kv_only_nextn          = h_mut.kv_only_nextn;
+            saved_n_layer_kv_from_start  = h_mut.n_layer_kv_from_start;
+            h_mut.kv_only_nextn         = true;
+            h_mut.n_layer_kv_from_start = -1;
+        }
+
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (do_nextn_override) {
+            llama_hparams & h_mut = const_cast<llama_hparams &>(model.hparams);
+            h_mut.kv_only_nextn         = saved_kv_only_nextn;
+            h_mut.n_layer_kv_from_start = saved_n_layer_kv_from_start;
+        }
     }
 
     // init backends
@@ -1953,7 +1977,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        const llm_graph_type decode_gtype = cparams.nextn_draft ? LLM_GRAPH_TYPE_NEXTN : LLM_GRAPH_TYPE_DECODER;
+        const auto * res = process_ubatch(ubatch, decode_gtype, mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2411,7 +2436,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const llm_graph_type reserve_gtype = cparams.nextn_draft ? LLM_GRAPH_TYPE_NEXTN : LLM_GRAPH_TYPE_DEFAULT;
+    const auto gparams = graph_params(res, ubatch, mctx, reserve_gtype);
 
     res->reset();
 
@@ -2440,9 +2466,20 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // For NextN draft contexts that share the target llama_model we hand a
+    // tweaked copy of hparams to the graph builder (kv_only_nextn=true so
+    // build_attn_inp_kv() routes attention to the single NextN layer's KV cells
+    // that create_memory() allocated for this context). The target context is
+    // unaffected because it keeps its own llm_graph_params built from the same
+    // (unmodified) model.hparams reference.
+    llama_hparams hparams_eff = model.hparams;
+    if (cparams.nextn_draft && hparams_eff.nextn_predict_layers > 0) {
+        hparams_eff.kv_only_nextn         = true;
+        hparams_eff.n_layer_kv_from_start = -1;
+    }
     return {
         /*.arch         =*/ model.arch,
-        /*.hparams      =*/ model.hparams,
+        /*.hparams      =*/ hparams_eff,
         /*.cparams      =*/ cparams,
         /*.ubatch       =*/ ubatch,
         /*.gtype        =*/ gtype,
@@ -3571,6 +3608,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.nextn_draft                 =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

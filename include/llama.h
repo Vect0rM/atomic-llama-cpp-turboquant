@@ -380,6 +380,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool nextn_draft; // this context is the Qwen NextN draft side: build the NextN draft graph against the *target* llama_model
+                          // (no second mmap of the combined MTP GGUF). Default false. Set true only for the draft context.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -509,6 +511,14 @@ extern "C" {
 
     // Backbone hidden size for MTP input (0 if no MTP assistant is loaded).
     LLAMA_API uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model);
+
+    // Qwen NextN: true when the target model was loaded from a combined *_MTP GGUF
+    // (i.e. hparams.nextn_predict_layers > 0) and its arch is one of {qwen35, qwen35moe}.
+    // Drives the shared-model NextN draft path (no second 22 GB mmap).
+    LLAMA_API bool llama_model_has_nextn_layer(const struct llama_model * model);
+
+    // Number of NextN predict layers stored in the target model (0 if none / not supported).
+    LLAMA_API uint32_t llama_model_n_nextn_predict_layers(const struct llama_model * model);
 
     LLAMA_API void llama_model_save_to_file(
             const struct llama_model * model,

@@ -672,57 +672,85 @@ private:
                 SRV_INF("MTP assistant path '%s' (loaded into target model)\n", params_spec.mparams_dft.path.c_str());
                 params_base.speculative.model_dft = nullptr;
             } else if (params_spec.type == COMMON_SPECULATIVE_TYPE_NEXTN) {
-                SRV_INF("loading NextN draft head from '%s' (override_arch)\n", params_spec.mparams_dft.path.c_str());
-
-                auto params_dft = params_base;
-
-                params_dft.n_parallel   = 1;
-                params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
-                params_dft.n_batch      = llama_n_ctx_seq(ctx);
-                params_dft.devices      = params_spec.devices;
-                params_dft.model        = params_spec.mparams_dft;
-                params_dft.n_gpu_layers = params_spec.n_gpu_layers;
-                params_dft.cache_type_k = params_spec.cache_type_k;
-                params_dft.cache_type_v = params_spec.cache_type_v;
-
-                if (params_spec.cpuparams.n_threads > 0) {
-                    params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
-                    params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
-                }
-
-                params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-
-                auto mparams_dft = common_model_params_to_llama(params_dft);
-                const char * arch_mtp = std::strcmp(llama_model_arch_str(model), "qwen35moe") == 0
-                        ? "qwen35moe_mtp"
-                        : "qwen35_mtp";
-
-                // override_arch is only needed when the draft is loaded from
-                // the same combined *_MTP.gguf as the target (the usual case).
-                // If the user points --model-draft at a standalone NextN GGUF
-                // whose general.architecture is already 'qwen35_mtp' /
-                // 'qwen35moe_mtp', skip the override and let the loader use
-                // the file's own arch (avoids double-mmap of the target file
-                // and partial_load tolerance).
+                // NextN draft path. Two backends:
+                //
+                //   (a) Shared-model path (default, no second mmap): target was loaded from a
+                //       combined *_MTP GGUF (hparams.nextn_predict_layers > 0). The NextN-layer
+                //       tensors physically live in the target model's tensor table already, so
+                //       we DON'T allocate a second llama_model — we just spin up a second
+                //       llama_context on top of the same llama_model with cparams.nextn_draft=true,
+                //       which routes build_graph() to the qwen35*_nextn builder. KV cache is sized
+                //       only for the target model's non-recurrent layers (small) and is per-context,
+                //       so the two contexts never share KV state. This eliminates the previous
+                //       ~22 GB second mmap (kIOGPUCommandBufferCallbackErrorOutOfMemory on M-series).
+                //
+                //   (b) Standalone NEXTN_ONLY GGUF (legacy): user passes a small extracted GGUF
+                //       (general.architecture = 'qwen35_mtp' / 'qwen35moe_mtp') as --model-draft.
+                //       In that case we fall back to the old second-model load — but without any
+                //       override_arch (the file's own arch is already correct). Only useful when
+                //       the user wants to ship the draft head as a separate artifact.
+                const bool target_has_nextn = llama_model_has_nextn_layer(model);
                 const bool draft_is_same_file =
                         params_spec.mparams_dft.path == params_base.model.path;
-                if (draft_is_same_file) {
-                    mparams_dft.override_arch = arch_mtp;
-                    SRV_INF("NextN draft: same file as target -> override_arch='%s'\n", arch_mtp);
+
+                if (target_has_nextn && draft_is_same_file) {
+                    SRV_INF("NextN draft: shared-model path (target %s, no second mmap; nextn_predict_layers=%u)\n",
+                            llama_model_arch_str(model),
+                            (unsigned) llama_model_n_nextn_predict_layers(model));
+
+                    auto params_dft = params_base;
+                    params_dft.n_parallel   = 1;
+                    params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                    params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                    params_dft.cache_type_k = params_spec.cache_type_k;
+                    params_dft.cache_type_v = params_spec.cache_type_v;
+                    if (params_spec.cpuparams.n_threads > 0) {
+                        params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                        params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    }
+
+                    auto cparams_dft = common_context_params_to_llama(params_dft);
+                    cparams_dft.nextn_draft = true;
+                    cparams_dft.n_rs_seq    = 0;
+
+                    params_base.speculative.model_dft   = model;
+                    params_base.speculative.cparams_dft = cparams_dft;
                 } else {
-                    SRV_INF("NextN draft: separate GGUF '%s' -> no override_arch (using file's own arch)\n",
-                            params_spec.mparams_dft.path.c_str());
-                }
+                    if (target_has_nextn) {
+                        SRV_INF("NextN draft: standalone GGUF '%s' (target has NextN but user pointed --model-draft at a separate file)\n",
+                                params_spec.mparams_dft.path.c_str());
+                    } else {
+                        SRV_INF("NextN draft: standalone GGUF '%s' (target arch=%s has no NextN tensors; loading second model)\n",
+                                params_spec.mparams_dft.path.c_str(),
+                                llama_model_arch_str(model));
+                    }
 
-                model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
-                if (model_dft == nullptr) {
-                    SRV_ERR("failed to load NextN draft model, '%s'\n", params_dft.model.path.c_str());
-                    return false;
-                }
+                    auto params_dft = params_base;
+                    params_dft.n_parallel   = 1;
+                    params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                    params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                    params_dft.devices      = params_spec.devices;
+                    params_dft.model        = params_spec.mparams_dft;
+                    params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+                    params_dft.cache_type_k = params_spec.cache_type_k;
+                    params_dft.cache_type_v = params_spec.cache_type_v;
+                    if (params_spec.cpuparams.n_threads > 0) {
+                        params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                        params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    }
+                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
-                params_base.speculative.model_dft   = model_dft.get();
-                params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
-                params_base.speculative.cparams_dft.n_rs_seq = 0;
+                    auto mparams_dft = common_model_params_to_llama(params_dft);
+                    model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+                    if (model_dft == nullptr) {
+                        SRV_ERR("failed to load NextN draft model, '%s'\n", params_dft.model.path.c_str());
+                        return false;
+                    }
+
+                    params_base.speculative.model_dft   = model_dft.get();
+                    params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                    params_base.speculative.cparams_dft.n_rs_seq = 0;
+                }
             } else {
                 SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
 

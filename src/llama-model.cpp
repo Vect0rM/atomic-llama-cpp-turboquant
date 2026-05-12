@@ -9523,11 +9523,27 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_QWEN35:
             {
-                llm = std::make_unique<llm_build_qwen35>(*this, params);
+                if (params.gtype == LLM_GRAPH_TYPE_NEXTN) {
+                    // Draft context (shared target llama_model, no second mmap): build the
+                    // NextN draft graph against this target. Target arch already loads the
+                    // NextN-layer tensors into model.layers[n_main + i].nextn.* for files
+                    // with nextn_predict_layers > 0 (combined *_MTP.gguf).
+                    GGML_ASSERT(hparams.nextn_predict_layers > 0 &&
+                            "QWEN35 with LLM_GRAPH_TYPE_NEXTN requires a target loaded from a combined _MTP GGUF (nextn_predict_layers > 0)");
+                    llm = std::make_unique<llm_build_qwen35_nextn>(*this, params);
+                } else {
+                    llm = std::make_unique<llm_build_qwen35>(*this, params);
+                }
             } break;
         case LLM_ARCH_QWEN35MOE:
             {
-                llm = std::make_unique<llm_build_qwen35moe>(*this, params);
+                if (params.gtype == LLM_GRAPH_TYPE_NEXTN) {
+                    GGML_ASSERT(hparams.nextn_predict_layers > 0 &&
+                            "QWEN35MOE with LLM_GRAPH_TYPE_NEXTN requires a target loaded from a combined _MTP GGUF (nextn_predict_layers > 0)");
+                    llm = std::make_unique<llm_build_qwen35moe_nextn>(*this, params);
+                } else {
+                    llm = std::make_unique<llm_build_qwen35moe>(*this, params);
+                }
             } break;
         case LLM_ARCH_QWEN35_NEXTN:
             {
