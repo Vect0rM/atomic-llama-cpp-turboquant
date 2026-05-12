@@ -696,7 +696,23 @@ private:
                 const char * arch_mtp = std::strcmp(llama_model_arch_str(model), "qwen35moe") == 0
                         ? "qwen35moe_mtp"
                         : "qwen35_mtp";
-                mparams_dft.override_arch = arch_mtp;
+
+                // override_arch is only needed when the draft is loaded from
+                // the same combined *_MTP.gguf as the target (the usual case).
+                // If the user points --model-draft at a standalone NextN GGUF
+                // whose general.architecture is already 'qwen35_mtp' /
+                // 'qwen35moe_mtp', skip the override and let the loader use
+                // the file's own arch (avoids double-mmap of the target file
+                // and partial_load tolerance).
+                const bool draft_is_same_file =
+                        params_spec.mparams_dft.path == params_base.model.path;
+                if (draft_is_same_file) {
+                    mparams_dft.override_arch = arch_mtp;
+                    SRV_INF("NextN draft: same file as target -> override_arch='%s'\n", arch_mtp);
+                } else {
+                    SRV_INF("NextN draft: separate GGUF '%s' -> no override_arch (using file's own arch)\n",
+                            params_spec.mparams_dft.path.c_str());
+                }
 
                 model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
                 if (model_dft == nullptr) {
@@ -2802,16 +2818,23 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            // MTP speculative decoding requires the *target* context to keep producing
-            // hidden states between rounds (the assistant draft consumes the last
-            // target hidden row as part of its input embedding). Without this, the
-            // server would reset embeddings to false for chat/completion tasks and the
-            // draft would always run on a zero h_prev, ruining acceptance rate.
-            const bool mtp_active =
+            // Gemma 4 MTP speculative decoding requires the *target* context to keep
+            // producing hidden states between rounds (the assistant draft consumes the
+            // last target hidden row as part of its input embedding). Without this,
+            // the server would reset embeddings to false for chat/completion tasks and
+            // the draft would always run on a zero h_prev, ruining acceptance rate.
+            //
+            // Qwen NextN does NOT need cparams.embeddings = true on the target:
+            // it consumes per-token PRE-norm hidden states via a separate channel
+            // (llama_set_embeddings_pre_norm + llama_get_embeddings_pre_norm_ith).
+            // Flipping cparams.embeddings on for NextN reroutes the target graph to
+            // emit pooled/embedding outputs in place of vocab logits, which then
+            // corrupts sampling for the very first generated token (and every chain
+            // thereafter).
+            const bool gemma_mtp_active =
                 slot_batched->spec != nullptr &&
-                (slot_batched->task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP
-                 || slot_batched->task->params.speculative.type == COMMON_SPECULATIVE_TYPE_NEXTN);
-            const bool need_embeddings = slot_batched->task->need_embd() || mtp_active;
+                slot_batched->task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+            const bool need_embeddings = slot_batched->task->need_embd() || gemma_mtp_active;
             llama_set_embeddings(ctx, need_embeddings);
         }
 
