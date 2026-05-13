@@ -25,6 +25,8 @@ matrix bench (§7):
 | Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | **`UD-Q4_K_XL`** (22.9 GB) | `qwen35moe` |
 | Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | **`UD-Q4_K_XL`** | `qwen35` |
 
+**AtomicChat `UDT` (UD-Turbo)** — this fork publishes additional combined `*_MTP.gguf` quants built with Unsloth’s public MTP-aware `imatrix_unsloth.gguf_file` plus our tensor-type masks (`scripts/quantize-masks/qwen36-ud-*.txt`) for NextN / TurboQuant3-oriented quality. End-to-end recipe: **[docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md)**; HF targets: [release/qwen-udt/HF_REPOS.md](release/qwen-udt/HF_REPOS.md).
+
 Both repos ship `UD-IQ1_M` … `BF16` quants. The shared-model NextN path
 works on **any** of them as long as the file contains the NextN auxiliary
 head (`nextn_predict_layers > 0`) — which all `*-MTP-GGUF` quants do by
@@ -191,3 +193,24 @@ The jump came from a single architectural change: dropping the second
 now runs without OOM and posts +24-36%; (b) draft KV cache resized only for the NextN layer
 (`kv_only_nextn = true` is mutated transparently in `llama_context` ctor for draft); (c) the
 NextN graph builder now flows through `LLM_GRAPH_TYPE_NEXTN` instead of `override_arch`.
+
+---
+
+## 8. UDT quantization recipe (calibration + masks)
+
+**Goal:** keep Unsloth’s **MTP-aware imatrix** (public `imatrix_unsloth.gguf_file` per HF repo) while applying **AtomicChat-specific** `--tensor-type-file` overrides:
+
+| File | Extra tensors vs base |
+|------|-------------------------|
+| `scripts/quantize-masks/qwen36-ud-base.txt` | `token_embd` / `output` high bit width; `attn_v` / `ffn_down` lifted; `ffn_gate_inp` for MoE |
+| `qwen36-ud-v1-nextn.txt` | All `blk.*.nextn.*` and `mtp.*` at `q8_0` (draft-head preservation) |
+| `qwen36-ud-v2-turbo3.txt` | `attn_q` / `attn_k` at `q6_K` (stack with TurboQuant3 KV) |
+| `qwen36-ud-v3-combined.txt` | Union of v1 + v2 (default release build) |
+
+**Build entrypoints**
+
+- Single quant: `scripts/quantize-qwen-udt.sh`
+- Full sweep: `scripts/quantize-qwen-udt-matrix.sh`
+- Remote / bench / HF: **[docs/qwen-udt/RUNBOOK.md](../docs/qwen-udt/RUNBOOK.md)**
+
+**Note:** `UDT` filenames use `…Q4_K_XL…` as a product tag; `llama-quantize` is still invoked with family types `Q4_K_M`, `Q5_K_M`, etc.

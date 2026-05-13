@@ -18,7 +18,7 @@ LLM inference in C/C++
 ## Hot topics
 
 - **Gemma 4 MTP speculative decoding: pair a `gemma4` target with the official `gemma4_assistant` head (loaded via `--mtp-head`) for ~+30-50 % short-prompt throughput. See [MTP.md](MTP.md) and the pre-built Q4 assistant GGUFs at the [AtomicChat/Gemma 4 Assistant GGUF collection](https://huggingface.co/collections/AtomicChat/gemma-4-assistant-gguf).**
-- **Qwen 3.6 NextN speculative decoding: point `--model-draft` at the same combined `*_MTP.gguf` and pass `--spec-type nextn` — the draft context reuses the target `llama_model` (no second mmap) and lands **+24-36 % tps** on Qwen 3.6 35B-A3B MoE, **+5-7 % tps** on Qwen 3.6 27B dense (MacBook Pro M4 Max, single-slot). See [NEXTN.md](NEXTN.md) and the pre-built combined `_MTP.gguf` quants at [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) / [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF).**
+- **Qwen 3.6 NextN speculative decoding: point `--model-draft` at the same combined `*_MTP.gguf` and pass `--spec-type nextn` — the draft context reuses the target `llama_model` (no second mmap) and lands **+24-36 % tps** on Qwen 3.6 35B-A3B MoE, **+5-7 % tps** on Qwen 3.6 27B dense (MacBook Pro M4 Max, single-slot). See [NEXTN.md](NEXTN.md) and the pre-built combined `_MTP.gguf` quants at [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) / [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF). Optional **AtomicChat `UDT`** quants (Unsloth imatrix + fork masks): [docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md).**
 - **TurboQuant KV cache & weights: WHT-rotated low-bit quantization with backend-native kernels (Metal `TurboFlash`, CUDA, Vulkan, HIP). Use `-ctk turbo3 -ctv turbo3` for ~4.3× KV compression, or quantize weights to `TQ4_1S`/`TQ3_1S`. See [Compression below](#turboquant-kv-cache--weight-compression).**
 - **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
 - **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
@@ -206,6 +206,8 @@ combined `*_MTP.gguf` files exercised in the matrix bench. The
 |---|---|
 | Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) |
 | Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) |
+
+**AtomicChat `UDT` quants (UD-Turbo)** — optional GGUFs built with Unsloth’s public MTP-aware imatrix plus fork-specific tensor masks for NextN + TurboQuant3 (`scripts/quantize-masks/qwen36-ud-*.txt`). See **[docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md)** and [release/qwen-udt/HF_REPOS.md](release/qwen-udt/HF_REPOS.md).
 
 ### Quick start
 
