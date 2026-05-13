@@ -614,8 +614,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
-        common_sampler_accept(gsmpl, id, true);
-        result.push_back(id);
         if (draft[i] != id) {
             if (p_accept > 0.0f) {
                 const float * logits = llama_get_logits_ith(ctx, idxs[i]);
@@ -625,12 +623,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
                 for (int j = 0; j < n_vocab; j++) sum += expf(logits[j] - max_l);
                 const float p_main = expf(logits[draft[i]] - max_l) / sum;
                 if (p_main >= p_accept) {
-                    result.back() = draft[i];
+                    common_sampler_accept(gsmpl, draft[i], true);
+                    result.push_back(draft[i]);
                     continue;
                 }
             }
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
             break;
         }
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
     }
 
     if (i == draft.size()) {
