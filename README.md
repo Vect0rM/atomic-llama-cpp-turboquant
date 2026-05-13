@@ -26,6 +26,7 @@ LLM inference in C/C++
 - [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
 - Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
 - Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
+- **This fork:** `--mmproj` can be loaded **alongside** `mtp` / `nextn` / `eagle3` speculative decoding on a single slot (validated on Qwen 3.6-35B-A3B-UDT + NextN + turbo3 KV and Gemma 4-26B-A4B + MTP + turbo3 KV). Draft acceleration applies to **text-only turns**; image-bearing turns fall back to plain target decoding (image still recognised). Other spec types remain disabled with multimodal. Details: [docs/speculative.md](./docs/speculative.md) and [NEXTN.md](./NEXTN.md) §10.
 - VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
 - Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
 - Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669

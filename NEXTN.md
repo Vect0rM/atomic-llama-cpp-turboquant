@@ -235,3 +235,35 @@ What's actually in each repo, and why it's a bit unusual for a quant drop:
 - **Apache-2.0**, attribution: Qwen team (weights), Unsloth (imatrix + BF16 sources), [@TheTom](https://github.com/TheTom) (TurboQuant), AtomicChat (UDT masks + packaging). Fork: [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant).
 
 The whole pipeline (download → quantize on H100 → bench on M4 Max → upload) is scripted in [`docs/qwen-udt/RUNBOOK.md`](../docs/qwen-udt/RUNBOOK.md); re-running it on the same Unsloth sources reproduces the published files bit-identical.
+
+---
+
+## 10. Multimodal (`--mmproj`) + speculative decoding (this fork)
+
+Upstream `llama-server` used to disable **all** speculative modes whenever a projector was loaded, so a single Qwen 3.6 / Gemma 4 server could not host vision and a draft head at the same time. In **atomic-llama-cpp-turboquant** the load-time and slot-init gates accept `--mmproj` together with:
+
+- **`--spec-type mtp`** (Gemma 4 assistant)
+- **`--spec-type nextn`** (Qwen3 NextN draft context)
+- **`--spec-type eagle3`** (stub impl; same contract)
+
+These three never look at the flattened `prompt_tgt` token stream — they read target hidden states / KV directly — so they can coexist with mtmd image chunks. Other modes stay disabled with a warning: separate **`draft`** models, all **`ngram_*`** modes, **`ctx_shift`** and **`cache_reuse`**.
+
+### What is and is not accelerated today
+
+- **Text-only turns on a multimodal slot** — draft head runs as usual. Same acceptance rates as the no-mmproj configuration.
+- **Turns that contain an image chunk** — server logs `skipping speculative prime for multimodal prompt` and falls back to plain target decoding for **that turn only**. The slot keeps generating text correctly, just without draft speedup.
+
+The reason for the fallback: NextN / MTP `begin()` needs the target's pre-norm hidden state at every prompt position, but the mtmd image-decode path only writes outputs for the last row of an image batch (`get_embeddings_pre_norm_ith` returns `null` for image-pad positions, see `tools/server/server-context.cpp`). Until image chunks emit per-token outputs, priming on a mixed token stream would leave the draft KV partially seeded and desynced from the target by image-expanded positions. Skipping the prime keeps the slot stable and lets the next pure-text turn re-enable drafting from scratch.
+
+### Verified configurations
+
+| Model | Spec | KV | mmproj | Image | Text reply | Decode |
+|---|---|---|---|---|---|---|
+| Qwen 3.6-35B-A3B-UDT-Q4_K_XL_MTP | `nextn` | turbo3 | F16 | recognised | OK | ~69 t/s |
+| Gemma 4-26B-A4B-it-UD-Q4_K_XL    | `mtp`   | turbo3 | F16 | recognised | OK | ~55 t/s |
+
+Both runs were validated on M4 Max with a single shared model file (no second mmap), `-c 4096`, `-fa on`.
+
+### Roadmap
+
+Real draft acceleration on the vision turn itself requires making mtmd image batches emit per-token outputs (or a teacher-forced replay through target). Tracked as a follow-up; not blocking this fork's release.

@@ -388,6 +388,15 @@ const llama_tokens & server_tokens::get_text_tokens() const {
     return tokens;
 }
 
+llama_tokens server_tokens::replace_media_null_tokens(llama_token replacement) const {
+    llama_tokens out;
+    out.reserve(tokens.size());
+    for (const llama_token t : tokens) {
+        out.push_back(t == LLAMA_TOKEN_NULL ? replacement : t);
+    }
+    return out;
+}
+
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;

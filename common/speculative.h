@@ -18,6 +18,13 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // note: clears the memory of the context
 bool common_speculative_is_compat(llama_context * ctx_tgt);
 
+// True for speculative modes that do not consume prompt_tgt in common_speculative_draft()
+// (MTP / NextN / EAGLE3 read target KV / hidden states instead). Safe to combine with --mmproj.
+bool common_speculative_is_mtmd_safe(enum common_speculative_type type);
+
+// True iff every registered impl is mtmd-safe (rejects mixed chains e.g. ngram + draft model).
+bool common_speculative_all_impls_mtmd_safe(const common_speculative * spec);
+
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt);

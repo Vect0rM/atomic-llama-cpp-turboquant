@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <exception>
 #include <memory>
@@ -32,6 +33,34 @@
 #endif
 
 using json = nlohmann::ordered_json;
+
+namespace {
+
+// Token used to replace LLAMA_TOKEN_NULL placeholders when priming Qwen NextN draft KV (see common_speculative_begin).
+static llama_token server_nextn_mtmd_fill_token(const llama_model * model) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (!vocab) {
+        return 0;
+    }
+    static const char * const k_candidates[] = {
+        "<|image_pad|>",
+        "<|IMAGE_PAD|>",
+        "<|vision_pad|>",
+    };
+    std::vector<llama_token> buf(32);
+    for (const char * piece : k_candidates) {
+        const int32_t n = llama_tokenize(
+                vocab, piece, (int32_t) std::strlen(piece),
+                buf.data(), (int32_t) buf.size(), false, true);
+        if (n == 1) {
+            return buf[0];
+        }
+    }
+    const llama_token pad = llama_vocab_pad(vocab);
+    return pad != LLAMA_TOKEN_NULL ? pad : 0;
+}
+
+} // namespace
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -820,9 +849,10 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type =  COMMON_SPECULATIVE_TYPE_NONE;
-                SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
+            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+                    !common_speculative_is_mtmd_safe(params_base.speculative.type)) {
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+                SRV_WRN("%s\n", "speculative decoding with this type is not supported by multimodal, it will be disabled");
             }
         }
 
@@ -888,8 +918,8 @@ private:
             if (can_spec) {
                 slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
                 if (slot.spec) {
-                    if (mctx) {
-                        SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
+                    if (mctx && !common_speculative_all_impls_mtmd_safe(slot.spec)) {
+                        SRV_ERR("%s\n", "speculative decoding with this type is not supported with multimodal");
                         return false;
                     }
                     // MTP reads target's KV memory by sequence id; bind to slot.id (server uses slot.id as seq_id).
@@ -2205,14 +2235,22 @@ private:
             // generate draft tokens in speculative decoding mode
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
             //       perform the speculative drafting for all sequences at the same time in a single batch
-            const int n_draft_max = slot.get_n_draft_max();
-            if (n_draft_max > 0) {
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
-                    GGML_ABORT("not supported by multimodal");
-                }
+            const int n_draft_max_raw = slot.get_n_draft_max();
+            const bool mtmd_safe_spec = slot.spec && common_speculative_all_impls_mtmd_safe(slot.spec);
+            if (mctx && n_draft_max_raw > 0 && !mtmd_safe_spec) {
+                GGML_ABORT("not supported by multimodal");
+            }
 
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+            // NextN/MTP prime requires per-token target hidden states which the mtmd image-decode
+            // path does not produce. Until that is wired in, skip drafting for slots whose prompt
+            // contains image chunks - the slot still works as a normal (non-speculative) decode.
+            const bool skip_draft_mtmd = mctx && slot.prompt.tokens.has_mtmd;
+            const int  n_draft_max     = skip_draft_mtmd ? 0 : n_draft_max_raw;
+
+            if (n_draft_max > 0) {
+                static const llama_tokens k_empty_prompt_tgt;
+                const llama_tokens & cached_text_tokens =
+                        (mctx && mtmd_safe_spec) ? k_empty_prompt_tgt : slot.prompt.tokens.get_text_tokens();
 
                 const auto & params_spec = slot.task->params.speculative;
 
@@ -3008,7 +3046,15 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                        if (slot.prompt.tokens.has_mtmd) {
+                            // Skip spec begin/prime for mtmd prompts: the per-token target hidden
+                            // states for image positions are not currently produced, which makes
+                            // NextN prime partial and could desync RoPE positions on later drafts.
+                            // The slot will still generate correctly via the non-speculative path.
+                            SLT_INF(slot, "%s", "skipping speculative prime for multimodal prompt\n");
+                        } else {
+                            common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                        }
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -3099,7 +3145,11 @@ private:
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
 
                 // add accepted tokens to the prompt
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+                // note: use push_back loop instead of insert() so mtmd prompts work too
+                //       (server_tokens::insert asserts !has_mtmd; push_back is mtmd-safe).
+                for (auto it = ids.begin(); it != ids.end() - 1; ++it) {
+                    slot.prompt.tokens.push_back(*it);
+                }
                 slot.sampled = ids.back(); // last accepted token
 
                 llama_context_nextn_seq_rm(ctx, slot.id, slot.prompt.n_tokens(), -1);
