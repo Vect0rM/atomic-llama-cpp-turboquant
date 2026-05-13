@@ -8,6 +8,19 @@ llama.cpp supports speculative decoding, a technique that can significantly acce
 
 The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
 
+### Multimodal (`--mmproj`) compatibility (atomic-llama-cpp-turboquant)
+
+When `--mmproj` is set, **`mtp`**, **`nextn`**, and **`eagle3`** speculative types remain **enabled at load**: their draft paths do not depend on `get_text_tokens()` / `prompt_tgt` the way `draft` and `ngram_*` do. Other types are auto-disabled at load with a warning. Mixed speculative chains (e.g. `ngram_simple` + `draft`) are rejected at slot init if any impl is not multimodal-safe.
+
+**Per-turn behaviour:**
+
+- **Text-only turns on a multimodal slot** — draft head runs as usual (same acceptance as without `--mmproj`).
+- **Turns containing an image chunk** — the slot logs `skipping speculative prime for multimodal prompt` and falls back to plain target decoding for that turn only. The image is still recognised correctly, just without draft speedup.
+
+The fallback is required because NextN / MTP prime needs per-token target hidden states for every prompt position, but mtmd image-decode currently only emits an output row for the last token of each image batch. Lifting this restriction is on the roadmap (mtmd batches need to mark every position with `logits[i] = true`, or be replayed teacher-forced).
+
+See `common_speculative_is_mtmd_safe` / `common_speculative_all_impls_mtmd_safe` in [`common/speculative.cpp`](../common/speculative.cpp), the `mmproj` gates and the `skip_draft_mtmd` per-turn gate in [`tools/server/server-context.cpp`](../tools/server/server-context.cpp). Validated configurations and the end-to-end recipe are documented in [`NEXTN.md` §10](../NEXTN.md#10-multimodal---mmproj--speculative-decoding-this-fork).
+
 ### Draft Model (`draft`)
 
 A much smaller model (called the _draft model_) generates drafts.

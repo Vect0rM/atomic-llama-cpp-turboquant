@@ -1700,6 +1700,29 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
     return it->second;
 }
 
+bool common_speculative_is_mtmd_safe(enum common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_MTP:
+        case COMMON_SPECULATIVE_TYPE_NEXTN:
+        case COMMON_SPECULATIVE_TYPE_EAGLE3:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool common_speculative_all_impls_mtmd_safe(const common_speculative * spec) {
+    if (!spec) {
+        return true;
+    }
+    for (const auto & impl : spec->impls) {
+        if (!common_speculative_is_mtmd_safe(impl->type)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool common_speculative_is_compat(llama_context * ctx_tgt) {
     auto * mem = llama_get_memory(ctx_tgt);
     if (mem == nullptr) {
