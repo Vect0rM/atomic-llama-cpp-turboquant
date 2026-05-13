@@ -7,6 +7,11 @@
 #   bash scripts/bench-matrix-qwen.sh
 # Env overrides:
 #   QWEN27_BASE, QWEN27_MTP, QWEN35_BASE, QWEN35_MTP — GGUF paths
+#   QWEN_BENCH_COMBINED_GGUF_ONLY — if 1, set QWEN*_BASE to same path as QWEN*_MTP (only *_MTP.gguf exists)
+#   BENCH_MODES_FILTER — comma-separated mode ids (subset of f16-base,turbo3-base,f16-nextn,turbo3-nextn)
+#   BENCH_MATRIX_MD — append markdown summary table to this file
+#   BENCH_LABEL — optional markdown heading printed before the summary block
+#   BENCH_QWEN_MODELS — all (default) | 27 | 35 (run only one row in the matrix)
 #   HOST, PORT, SHORT_N, LONG_N, RUNS, CTX (context size for server)
 
 set -uo pipefail
@@ -32,13 +37,28 @@ QWEN27_MTP="${QWEN27_MTP:-$ROOT/.scratch/Qwen3.6-27B-UD-Q4_K_XL_MTP/Qwen3.6-27B-
 QWEN35_BASE="${QWEN35_BASE:-$ROOT/.scratch/qwen-3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}"
 QWEN35_MTP="${QWEN35_MTP:-$ROOT/.scratch/Qwen3.6-35B-A3B-UD-Q4_K_XL_MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL_MTP.gguf}"
 
+if [[ "${QWEN_BENCH_COMBINED_GGUF_ONLY:-0}" == "1" ]]; then
+  QWEN27_BASE="$QWEN27_MTP"
+  QWEN35_BASE="$QWEN35_MTP"
+fi
+
 PROMPT='Write a detailed 300-word essay about the history of artificial intelligence, including early pioneers like Alan Turing and John McCarthy, key milestones such as the Dartmouth Conference and the development of expert systems, and future predictions about AGI and superintelligence.'
 
 # model_id | run_script | gguf_baseline (no NextN) | gguf_mtp (NextN draft = same file)
-MODELS=(
+ALL_MODELS=(
   "qwen-27B|${ROOT}/scripts/run-qwen36-27b-nextn-server.sh|${QWEN27_BASE}|${QWEN27_MTP}"
   "qwen-35B-A3B|${ROOT}/scripts/run-qwen36-35ba3b-nextn-server.sh|${QWEN35_BASE}|${QWEN35_MTP}"
 )
+
+case "${BENCH_QWEN_MODELS:-all}" in
+  all) MODELS=("${ALL_MODELS[@]}") ;;
+  27)  MODELS=("${ALL_MODELS[0]}") ;;
+  35)  MODELS=("${ALL_MODELS[1]}") ;;
+  *)
+    echo "error: BENCH_QWEN_MODELS must be all|27|35 (got ${BENCH_QWEN_MODELS})" >&2
+    exit 1
+    ;;
+esac
 
 # mode_id | SPEC (off|nextn) | CTK (propagated to CTV/CTKD/CTVD by run script)
 MODES=(
@@ -47,6 +67,12 @@ MODES=(
   "f16-nextn|nextn|f16"
   "turbo3-nextn|nextn|turbo3"
 )
+
+mode_allowed() {
+  local mid="$1"
+  [[ -z "${BENCH_MODES_FILTER:-}" ]] && return 0
+  [[ ",${BENCH_MODES_FILTER}," == *",${mid},"* ]]
+}
 
 SRV_LOG=$(mktemp -t bench-matrix-qwen-srv.XXXXXX.log)
 
@@ -263,28 +289,43 @@ for model_entry in "${MODELS[@]}"; do
   fi
   for mode_entry in "${MODES[@]}"; do
     IFS='|' read -r mode_id spec ctk <<< "${mode_entry}"
+    mode_allowed "$mode_id" || continue
     run_cell "${model_id}" "${run_script}" "${gguf_base}" "${gguf_mtp}" "${mode_id}" "${spec}" "${ctk}" || true
   done
 done
 
-echo ""
-echo "## Qwen3.6 bench matrix (median tps over ${RUNS} runs; accept% from draft_n / draft_n_accepted)"
-echo ""
-printf "| model | mode | short tps (n=%d) | long tps (n=%d) | short accept | long accept |\n" "${SHORT_N}" "${LONG_N}"
-echo "|---|---|---:|---:|---:|---:|"
-for model_entry in "${MODELS[@]}"; do
-  IFS='|' read -r model_id _ _ _ <<< "${model_entry}"
-  for mode_entry in "${MODES[@]}"; do
-    IFS='|' read -r mode_id _ _ <<< "${mode_entry}"
-    short_val="${RESULTS["${model_id}|${mode_id}|short"]:-N/A|-}"
-    long_val="${RESULTS["${model_id}|${mode_id}|long"]:-N/A|-}"
-    short_tps="${short_val%|*}"
-    short_acc="${short_val#*|}"
-    long_tps="${long_val%|*}"
-    long_acc="${long_val#*|}"
-    printf "| %s | %s | %s | %s | %s%% | %s%% |\n" \
-      "${model_id}" "${mode_id}" "${short_tps}" "${long_tps}" "${short_acc}" "${long_acc}"
+emit_summary() {
+  if [[ -n "${BENCH_LABEL:-}" ]]; then
+    echo "${BENCH_LABEL}"
+    echo ""
+  fi
+  echo "## Qwen3.6 bench matrix (median tps over ${RUNS} runs; accept% from draft_n / draft_n_accepted)"
+  echo ""
+  printf "| model | mode | short tps (n=%d) | long tps (n=%d) | short accept | long accept |\n" "${SHORT_N}" "${LONG_N}"
+  echo "|---|---|---:|---:|---:|---:|"
+  for model_entry in "${MODELS[@]}"; do
+    IFS='|' read -r model_id _ _ _ <<< "${model_entry}"
+    for mode_entry in "${MODES[@]}"; do
+      IFS='|' read -r mode_id _ _ <<< "${mode_entry}"
+      mode_allowed "$mode_id" || continue
+      short_val="${RESULTS["${model_id}|${mode_id}|short"]:-N/A|-}"
+      long_val="${RESULTS["${model_id}|${mode_id}|long"]:-N/A|-}"
+      short_tps="${short_val%|*}"
+      short_acc="${short_val#*|}"
+      long_tps="${long_val%|*}"
+      long_acc="${long_val#*|}"
+      printf "| %s | %s | %s | %s | %s%% | %s%% |\n" \
+        "${model_id}" "${mode_id}" "${short_tps}" "${long_tps}" "${short_acc}" "${long_acc}"
+    done
   done
-done
-echo ""
-echo "(last server log: ${SRV_LOG})"
+  echo ""
+  echo "(last server log: ${SRV_LOG})"
+}
+
+if [[ -n "${BENCH_MATRIX_MD:-}" ]]; then
+  echo ""
+  emit_summary | tee -a "$BENCH_MATRIX_MD"
+else
+  echo ""
+  emit_summary
+fi
