@@ -18,7 +18,7 @@ LLM inference in C/C++
 ## Hot topics
 
 - **Gemma 4 MTP speculative decoding: pair a `gemma4` target with the official `gemma4_assistant` head (loaded via `--mtp-head`) for ~+30-50 % short-prompt throughput. See [MTP.md](MTP.md) and the pre-built Q4 assistant GGUFs at the [AtomicChat/Gemma 4 Assistant GGUF collection](https://huggingface.co/collections/AtomicChat/gemma-4-assistant-gguf).**
-- **Qwen 3.6 NextN speculative decoding: point `--model-draft` at the same combined `*_MTP.gguf` and pass `--spec-type nextn` — the draft context reuses the target `llama_model` (no second mmap) and lands **+24-36 % tps** on Qwen 3.6 35B-A3B MoE, **+5-7 % tps** on Qwen 3.6 27B dense (MacBook Pro M4 Max, single-slot). See [NEXTN.md](NEXTN.md) and the pre-built combined `_MTP.gguf` quants at [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) / [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF). Optional **AtomicChat `UDT`** quants (Unsloth imatrix + fork masks): [docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md).**
+- **Qwen 3.6 NextN speculative decoding: point `--model-draft` at the same combined `*_MTP.gguf` and pass `--spec-type nextn` — the draft context reuses the target `llama_model` (no second mmap) and lands +24-36 % tps on Qwen 3.6 35B-A3B MoE, +5-7 % tps on Qwen 3.6 27B dense (MacBook Pro M4 Max, single-slot). See [NEXTN.md](NEXTN.md). Recommended pre-built combined `_MTP.gguf` quants live in the **[AtomicChat — Qwen 3.6 UDT](https://huggingface.co/collections/AtomicChat/qwen-36-udt-atomicchat-6a0481f5cc5a057c07759176)** collection ([27B](https://huggingface.co/AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF) · [35B-A3B](https://huggingface.co/AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF)) — built with the Unsloth public MTP-aware imatrix + fork masks that pin NextN/MTP tensors to `Q8_0` (preserves draft acceptance) and lift attention Q/K to `Q6_K` (pairs cleanly with TurboQuant3 KV); upstream sources also work: [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) / [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF).**
 - **TurboQuant KV cache & weights: WHT-rotated low-bit quantization with backend-native kernels (Metal `TurboFlash`, CUDA, Vulkan, HIP). Use `-ctk turbo3 -ctv turbo3` for ~4.3× KV compression, or quantize weights to `TQ4_1S`/`TQ3_1S`. See [Compression below](#turboquant-kv-cache--weight-compression).**
 - **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
 - **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
@@ -198,16 +198,22 @@ Highlights:
 
 ### Pre-built model GGUFs
 
-Recommended source is the **unsloth** Hugging Face collection — the same
-combined `*_MTP.gguf` files exercised in the matrix bench. The
-`UD-Q4_K_XL` quant is the recommended default (matches the bench cells).
+**Recommended:** the AtomicChat **UDT** (UD-Turbo) collection — drop-in combined `_MTP.gguf` quants tuned for this fork. One repo per model, 5 quants each (Q3 / **Q4** / Q5 / Q6 / Q8 `_K_XL`), plus the `mmproj` for vision and the original Unsloth imatrix re-hosted for reproducibility:
 
-| Target | Combined `_MTP.gguf` (target + NextN head) |
-|---|---|
-| Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) |
-| Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) |
+| Target | Recommended (AtomicChat UDT) | Upstream baseline (Unsloth) |
+|---|---|---|
+| Qwen 3.6 35B-A3B (MoE) | [`AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) |
+| Qwen 3.6 27B (dense)   | [`AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF)         | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF)         |
 
-**AtomicChat `UDT` quants (UD-Turbo)** — optional GGUFs built with Unsloth’s public MTP-aware imatrix plus fork-specific tensor masks for NextN + TurboQuant3 (`scripts/quantize-masks/qwen36-ud-*.txt`). See **[docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md)** and [release/qwen-udt/HF_REPOS.md](release/qwen-udt/HF_REPOS.md).
+What makes UDT different from a vanilla `llama-quantize -imatrix` run:
+
+- **MTP-aware imatrix** — calibrated by Unsloth with the NextN head active (we re-host their public [`imatrix_unsloth.gguf_file`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/blob/main/imatrix_unsloth.gguf_file) so you can reproduce or re-mix on top of it).
+- **NextN-preserve mask** — every `blk.*.nextn.*` and `mtp.*` tensor pinned to `Q8_0`. Tiny size cost (~10 MiB), keeps draft acceptance high.
+- **TurboQuant3-friendly mask** — `attn_q` / `attn_k` bumped to `Q6_K` so the file pairs cleanly with `-ctk turbo3 -ctv turbo3`.
+- **Combined `_MTP.gguf`** — target + NextN head in one file, ready for the shared-model speculative path (`-m` and `-md` point at the same path; no second mmap).
+- **Apache-2.0**, full attribution: Qwen team (weights), Unsloth (imatrix + BF16 sources), @TheTom (TurboQuant), AtomicChat (UDT masks + packaging).
+
+Collection: [AtomicChat — Qwen 3.6 UDT](https://huggingface.co/collections/AtomicChat/qwen-36-udt-atomicchat-6a0481f5cc5a057c07759176). Full recipe & runbook: [docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md). Mask files: [`scripts/quantize-masks/qwen36-ud-{base,v1-nextn,v2-turbo3,v3-combined}.txt`](scripts/quantize-masks).
 
 ### Quick start
 
@@ -215,8 +221,8 @@ combined `*_MTP.gguf` files exercised in the matrix bench. The
 # Pull both target (-hf) and draft (-hfd) from the same HF combined _MTP.gguf;
 # they resolve to the same cached file → the server takes the shared-model branch.
 llama-server \
-  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
-  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hf  AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF:Q4_K_XL \
+  -hfd AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF:Q4_K_XL \
   --spec-type nextn \
   --draft-max 2 --draft-min 1 \
   -c 8192 \
@@ -762,13 +768,15 @@ To learn more about model quantization, [read this documentation](tools/quantize
     35B-A3B MoE the combination is **+24-36 % tps** vs the same target
     without speculation.
 
-    Pre-built combined `_MTP.gguf` quants (recommended **`UD-Q4_K_XL`**,
+    Pre-built combined `_MTP.gguf` quants (recommended **`Q4_K_XL`**,
     matches the matrix bench cells):
 
     | Target | Combined `_MTP.gguf` |
     |---|---|
-    | Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) |
-    | Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) |
+    | Qwen 3.6 35B-A3B (MoE) — AtomicChat UDT | [`AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF) |
+    | Qwen 3.6 27B (dense)   — AtomicChat UDT | [`AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF) |
+    | Qwen 3.6 35B-A3B (MoE) — Unsloth        | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) |
+    | Qwen 3.6 27B (dense)   — Unsloth        | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) |
 
     ```bash
     # Pull both target (-hf) and draft (-hfd) from the same HF combined _MTP.gguf.

@@ -44,7 +44,7 @@ case "$MODEL" in
     INP="${BF16_INPUT:-}"
     if [[ -z "$INP" ]]; then
       shopt -s nullglob
-      cand=( "${SOURCES}/${SUB}"/Qwen3.6-27B-BF16-*.gguf )
+      cand=( "${SOURCES}/${SUB}/BF16"/Qwen3.6-27B-BF16-*.gguf "${SOURCES}/${SUB}"/Qwen3.6-27B-BF16-*.gguf )
       shopt -u nullglob
       INP="${cand[0]:-}"
     fi
@@ -53,9 +53,10 @@ case "$MODEL" in
     PREFIX="Qwen3.6-35B-A3B"
     SUB="${QWEN_UDT_SUBDIR_35:-35a3b}"
     IMT="${IMATRIX_FILE:-${SOURCES}/${SUB}/imatrix_unsloth.gguf_file}"
+    INP="${BF16_INPUT:-}"
     if [[ -z "$INP" ]]; then
       shopt -s nullglob
-      cand=( "${SOURCES}/${SUB}"/Qwen3.6-35B-A3B-BF16-*.gguf )
+      cand=( "${SOURCES}/${SUB}/BF16"/Qwen3.6-35B-A3B-BF16-*.gguf "${SOURCES}/${SUB}"/Qwen3.6-35B-A3B-BF16-*.gguf )
       shopt -u nullglob
       INP="${cand[0]:-}"
     fi
@@ -66,11 +67,15 @@ case "$MODEL" in
 esac
 
 case "$FTYPE" in
-  Q3_K_M|Q4_K_M|Q5_K_M|Q6_K) ;;
-  *) echo "error: unsupported ftype '$FTYPE' (expected Q3_K_M|Q4_K_M|Q5_K_M|Q6_K)" >&2; exit 1 ;;
+  Q3_K_M|Q4_K_M|Q5_K_M|Q6_K|Q8_0) ;;
+  *) echo "error: unsupported ftype '$FTYPE' (expected Q3_K_M|Q4_K_M|Q5_K_M|Q6_K|Q8_0)" >&2; exit 1 ;;
 esac
 
-XL_TAG="${FTYPE/_K_M/_K_XL}"
+case "$FTYPE" in
+  Q3_K_M|Q4_K_M|Q5_K_M) XL_TAG="${FTYPE/_K_M/_K_XL}" ;;
+  Q6_K) XL_TAG="Q6_K" ;;
+  Q8_0) XL_TAG="Q8_K_XL" ;;
+esac
 case "$VARIANT" in
   base) SUFFIX="-base" ;;
   v1)   SUFFIX="-V1" ;;

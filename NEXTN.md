@@ -16,18 +16,16 @@ See also `MTP.md` (Gemma) and `docs/speculative.md` for shared CLI concepts.
 
 ## 0. Pre-built model GGUFs
 
-Recommended source for Qwen 3.6 combined `*_MTP.gguf` checkpoints is the
-**unsloth** Hugging Face collection — the same files exercised in the
-matrix bench (§7):
+**Recommended:** the [AtomicChat — Qwen 3.6 UDT](https://huggingface.co/collections/AtomicChat/qwen-36-udt-atomicchat-6a0481f5cc5a057c07759176) collection — drop-in combined `*_MTP.gguf` quants tuned for this fork. Each repo ships Q3 / **Q4** / Q5 / Q6 / Q8 `_K_XL`, plus the `mmproj` for vision and a copy of `imatrix_unsloth.gguf_file` for reproducibility. Upstream Unsloth files keep working too — same arch metadata, same NextN tail.
 
-| Target | Combined `_MTP.gguf` (target + NextN head) | Recommended quant | Architecture |
+| Target | Recommended (AtomicChat UDT) | Upstream baseline (Unsloth) | Architecture |
 |---|---|---|---|
-| Qwen 3.6 35B-A3B (MoE) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | **`UD-Q4_K_XL`** (22.9 GB) | `qwen35moe` |
-| Qwen 3.6 27B (dense)   | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | **`UD-Q4_K_XL`** | `qwen35` |
+| Qwen 3.6 35B-A3B (MoE) | [`AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF) (`Q4_K_XL` ≈ 20.7 GiB) | [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | `qwen35moe` |
+| Qwen 3.6 27B (dense)   | [`AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF) (`Q4_K_XL` ≈ 17.7 GiB)             | [`unsloth/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF)             | `qwen35`    |
 
-**AtomicChat `UDT` (UD-Turbo)** — this fork publishes additional combined `*_MTP.gguf` quants built with Unsloth’s public MTP-aware `imatrix_unsloth.gguf_file` plus our tensor-type masks (`scripts/quantize-masks/qwen36-ud-*.txt`) for NextN / TurboQuant3-oriented quality. End-to-end recipe: **[docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md)**; HF targets: [release/qwen-udt/HF_REPOS.md](release/qwen-udt/HF_REPOS.md).
+**Why UDT** — built on Unsloth's public MTP-aware [`imatrix_unsloth.gguf_file`](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/blob/main/imatrix_unsloth.gguf_file), then layered with this fork's tensor-type masks (see §8): every `blk.*.nextn.*` / `mtp.*` tensor pinned to `Q8_0` to preserve draft acceptance, and `attn_q` / `attn_k` lifted to `Q6_K` so the file pairs cleanly with TurboQuant3 KV. End-to-end recipe & runbook: [docs/qwen-udt/RUNBOOK.md](docs/qwen-udt/RUNBOOK.md). Attribution: Qwen team (weights), Unsloth (imatrix + BF16 sources), @TheTom (TurboQuant), AtomicChat (UDT masks + packaging).
 
-Both repos ship `UD-IQ1_M` … `BF16` quants. The shared-model NextN path
+The shared-model NextN path
 works on **any** of them as long as the file contains the NextN auxiliary
 head (`nextn_predict_layers > 0`) — which all `*-MTP-GGUF` quants do by
 construction. `scripts/verify-qwen36-nextn-gguf.py` will refuse to load a
@@ -39,15 +37,15 @@ the same file in the HF cache and takes the shared-model branch:
 ```bash
 # 35B-A3B MoE (headline +24-36 % cell in the matrix)
 llama-server \
-  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
-  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hf  AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF:Q4_K_XL \
+  -hfd AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF:Q4_K_XL \
   --spec-type nextn --draft-max 2 --draft-min 1 \
   -c 8192 -ngl 99 -ngld 99 -fa on
 
 # 27B dense
 llama-server \
-  -hf  unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
-  -hfd unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  -hf  AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF:Q4_K_XL \
+  -hfd AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF:Q4_K_XL \
   --spec-type nextn --draft-max 2 --draft-min 1 \
   -c 8192 -ngl 99 -ngld 99 -fa on
 ```
@@ -123,8 +121,8 @@ let `llama-server` pull both from Hugging Face into the local cache:
 
 ```bash
 llama-server \
-  -hf  unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
-  -hfd unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL \
+  -hf  AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF:Q4_K_XL \
+  -hfd AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF:Q4_K_XL \
   --spec-type nextn --draft-max 2 --draft-min 1
 ```
 
@@ -132,11 +130,12 @@ llama-server \
 
 ## 7. Performance notes (MacBook Pro M4 Max, 40-core GPU, 48 GB, Metal)
 
-Median TPS over 3 runs, prompt = 50-token instruction, `--draft-max=2 --draft-min=1`,
+Median TPS over 2 runs, prompt = 50-token instruction, `--draft-max=2 --draft-min=1`,
 NextN draft DM=2 (single async chain), context 8192. Single-slot
 (`--parallel 1 -np 1 --cont-batching`), full GPU offload (`-ngl 99 -ngld 99 -fa on`),
-shared-model draft path (no second mmap of combined `_MTP.gguf`). See
-`.scratch/bench-logs/qwen-matrix-fullrun-20260512-222625.md`.
+shared-model draft path (no second mmap of combined `_MTP.gguf`),
+AtomicChat **`UDT-Q4_K_XL_MTP`** file. See
+`.scratch/bench-logs/qwen-udt-ab-20260513-132549.md`.
 
 ### Bench host
 
@@ -214,3 +213,25 @@ NextN graph builder now flows through `LLM_GRAPH_TYPE_NEXTN` instead of `overrid
 - Remote / bench / HF: **[docs/qwen-udt/RUNBOOK.md](../docs/qwen-udt/RUNBOOK.md)**
 
 **Note:** `UDT` filenames use `…Q4_K_XL…` as a product tag; `llama-quantize` is still invoked with family types `Q4_K_M`, `Q5_K_M`, etc.
+
+---
+
+## 9. Released artifacts — AtomicChat UDT collection
+
+The recipe above ships as two ready-to-pull Hugging Face repos, grouped into one collection:
+
+- Collection — [AtomicChat — Qwen 3.6 UDT](https://huggingface.co/collections/AtomicChat/qwen-36-udt-atomicchat-6a0481f5cc5a057c07759176)
+- 27B dense — [`AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-27B-UDT-MTP-GGUF)
+- 35B-A3B MoE — [`AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF`](https://huggingface.co/AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF)
+
+What's actually in each repo, and why it's a bit unusual for a quant drop:
+
+- **5 quants per model, all `_MTP.gguf`** — `Q3_K_XL` / `Q4_K_XL` / `Q5_K_XL` / `Q6_K` / `Q8_K_XL`. Every file already includes the NextN auxiliary head, so the same path works for `-m` *and* `-md` — no second GGUF, no second mmap, no second tokenizer.
+- **NextN-preserve mask (V1)** — every `blk.*.nextn.*` and `mtp.*` tensor pinned to `Q8_0`. The cost is ~10 MiB of file size; the win is that the draft head stays close to BF16 fidelity, which keeps `acceptance` high under `--spec-type nextn`. Plain UD quants compress the head at the same bit-width as the body and bleed acceptance under `turbo3` KV.
+- **TurboQuant3-friendly mask (V2)** — attention Q/K bumped to `Q6_K`. This is the piece we tuned specifically for this fork: when KV is compressed to 3-bit via `-ctk turbo3 -ctv turbo3`, the attention scores see extra dequant noise on K, so giving Q/K a little more headroom on the weight side cancels most of it out.
+- **Default release = V3 (V1 ∪ V2)** — the combined mask shipped on Hugging Face. V1-only and V2-only quants exist as ablation artifacts in the build tree but are not published; the V3 file simply has both lifts at once.
+- **mmproj mirrored from Unsloth** — `mmproj-F16.gguf` and `mmproj-BF16.gguf` re-hosted byte-for-byte from the corresponding `unsloth/Qwen3.6-*-MTP-GGUF` repo so a single `-hf` line gets you target + draft + projector.
+- **`imatrix_unsloth.gguf_file` re-hosted** — same artifact as Unsloth's (77-chunk, MTP-aware), included in each repo so the build is reproducible from a clean clone of the recipe.
+- **Apache-2.0**, attribution: Qwen team (weights), Unsloth (imatrix + BF16 sources), [@TheTom](https://github.com/TheTom) (TurboQuant), AtomicChat (UDT masks + packaging). Fork: [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant).
+
+The whole pipeline (download → quantize on H100 → bench on M4 Max → upload) is scripted in [`docs/qwen-udt/RUNBOOK.md`](../docs/qwen-udt/RUNBOOK.md); re-running it on the same Unsloth sources reproduces the published files bit-identical.
