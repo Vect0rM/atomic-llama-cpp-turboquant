@@ -13,6 +13,7 @@ llama_add_compile_flags()
 # tools
 
 if (EMSCRIPTEN)
+    add_subdirectory(wasm)
 else()
     add_subdirectory(batched-bench)
     add_subdirectory(gguf-split)
